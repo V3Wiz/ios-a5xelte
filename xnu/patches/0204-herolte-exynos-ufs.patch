@@ -12,10 +12,10 @@ index 851addd..75545e7 100644
  bsd/dev/sweet_sample.c			standard
 diff --git a/bsd/dev/herolte_ufs.c b/bsd/dev/herolte_ufs.c
 new file mode 100644
-index 0000000..4256305
+index 0000000..2bbe492
 --- /dev/null
 +++ b/bsd/dev/herolte_ufs.c
-@@ -0,0 +1,769 @@
+@@ -0,0 +1,798 @@
 +/*
 + * HEROLTE (Galaxy S7, Exynos 8890) internal UFS root device.
 + *
@@ -378,6 +378,29 @@ index 0000000..4256305
 +	return ENOENT;
 +}
 +
++/*
++ * Bring the device to the Active power mode: clear the unit attention of the
++ * UFS Device well-known LUN, then START STOP UNIT with power condition 1
++ * (ACTIVE), as ufshcd_set_dev_pwr_mode() does. Leaves su.lun at 0.
++ */
++static int
++ufs_wake_device(void)
++{
++	static const uint8_t tur[6] = { 0x00 };
++	static const uint8_t ssu[6] = { 0x1b, 0, 0, 0, 0x10, 0 };
++	int error = 0;
++
++	su.lun = 0xd0;                          /* UFS Device W-LUN */
++	for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++	}
++	printf("HEROLTE UFS: device W-LUN TEST UNIT READY %d\n", error);
++	for (int i = 0; i < 3 && (error = ufs_scsi(ssu, sizeof(ssu), 0, false)); i++) {
++	}
++	printf("HEROLTE UFS: START STOP UNIT (ACTIVE) %d\n", error);
++	su.lun = 0;
++	return error;
++}
++
 +static int
 +ufs_take_over_host(void)
 +{
@@ -649,6 +672,9 @@ index 0000000..4256305
 +	lck_mtx_lock(&herolte_ufs_lock);
 +	error = ufs_take_over_host();
 +	if (!error) {
++		(void)ufs_wake_device();
++	}
++	if (!error) {
 +		static const uint8_t tur[6] = { 0x00 };
 +		/* The first command after the bootloader may report a unit attention. */
 +		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
@@ -717,8 +743,11 @@ index 0000000..4256305
 +	lck_mtx_lock(&herolte_ufs_lock);
 +	int error = ufs_take_over_host();
 +	if (!error) {
++		(void)ufs_wake_device();
++	}
++	if (!error) {
 +		static const uint8_t tur[6] = { 0x00 };
-+		for (unsigned lun = 0; lun < 8; lun++) {
++		for (unsigned lun = 0; lun < 4; lun++) {
 +			int e = 0;
 +			su.lun = (uint8_t)lun;
 +			for (int i = 0; i < 3 && (e = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {

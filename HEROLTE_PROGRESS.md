@@ -81,4 +81,10 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   offsets en bytes, PRDT, NEXUS, doorbell) funciona. El probe no siguió a
   READ porque abortaba tras el TUR. Siguiente: imprimir el sense, probar
   LUN 0..7 y leer LBA1 aunque falle el TUR.
+- **Segundo probe UFS** (run 39486812960, kernel `00f0b0da…deb1`): LUN 0–3
+  responden NOT READY (sense key 2, ASC/ASCQ 0/0); LUN 4–7 ILLEGAL REQUEST
+  ASC 0x25 (no existen: el S7 tiene 4 LU). READ(10) LBA1 en LUN 0: NOT
+  READY. Hipótesis: S-Boot deja el dispositivo en un modo de bajo consumo;
+  Linux lo reactiva con START STOP UNIT (ACTIVE) al W-LUN UFS Device
+  (`0xD0`). `0204` ahora lo hace antes del primer comando (probe e init).
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
