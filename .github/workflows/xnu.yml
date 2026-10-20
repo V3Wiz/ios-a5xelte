@@ -87,7 +87,32 @@ jobs:
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        run: |
+          set -o pipefail
+          bash build.sh 2>&1 | tee ../build.log
+
+      # Logs need a GitHub sign-in to read; check-run annotations are public.
+      # Publish the first errors and the log tail so failures can be read
+      # through the API (repos/.../check-runs/<job>/annotations).
+      - name: Report build errors as annotations
+        if: always()
+        run: |
+          test -f build.log || exit 0
+          kernel="dxb/fakeroot/System/Library/Kernels/kernel.$(echo "$KERNEL_CONFIG" | tr A-Z a-z).$(echo "$MACHINE_CONFIG" | tr A-Z a-z)"
+          if [ -f "$kernel" ]; then echo "kernel built: $kernel"; exit 0; fi
+          python3 - build.log <<'PY'
+          import re, sys
+          lines = open(sys.argv[1], errors='replace').read().splitlines()
+          clean = [re.sub(r'\x1b\[[0-9;]*m', '', l) for l in lines]
+          pat = re.compile(r'(error:|fatal error|Error \d|\*\*\* |FAILED|Skipping patch|No such file|panic|❌)', re.I)
+          hits = [l for l in clean if pat.search(l)]
+          esc = lambda s: s.replace('%', '%25').replace('\r', '').replace('\n', '%0A')
+          for l in hits[:9]:
+              print('::error title=build::' + esc(l[:900]))
+          tail = '\n'.join(l[:300] for l in clean[-60:])
+          print('::error title=build log tail::' + esc(tail[-30000:]))
+          PY
+          exit 1
 
       - name: Package build tree for local compiles
         if: always()
