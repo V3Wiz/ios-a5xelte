@@ -1,8 +1,10 @@
 # A5XELTE GPU port: measured boundary and implementation order
 
-Status: the phone reads Mali-T720 `GPU_ID=07201000` and patch `0130` has
-completed one isolated GPU memory write with no MMU fault. An iOS GPU API
-bridge and GPU-rendered SpringBoard frames have not been observed.
+Status: the phone reads Mali-T720 `GPU_ID=07201000`, patch `0130` completed
+one isolated GPU memory write, patch `0132` GPU-rendered all 256 pixels of a
+private 16×16 target, and patch `0133` GPU-rendered a green square directly
+into the display scanout buffer, visible on the phone. An iOS GPU API bridge
+and GPU-rendered SpringBoard frames have not been observed.
 
 ## Stage-1 code candidate
 
@@ -115,8 +117,23 @@ Patch `0132-a5xelte-g3d-page-aligned-polygon-list.patch` gives the polygon
 list its own 4 KiB-aligned page and moves the output to a separate page, as
 Mesa's independent polygon BO allocation does. It also logs the job header's
 exception and fault pointer plus GPU fault address/status. The 0132 BOOT was
-linked and written only to p10. Its result awaits the next device log. The
-alignment difference is a testable hypothesis, not a confirmed root cause.
+linked and written only to p10. The phone's SYSTEM log recorded JS0 IRQ `1`,
+no MMU or GPU fault, job header exception `1` (DONE), and `256/256` expected
+red pixels. This confirms offscreen fragment rendering on the physical Mali.
+The page-alignment hypothesis matches the successful result, though the log
+does not isolate every possible field the hardware checked.
+
+Patch `0133-a5xelte-g3d-direct-scanout-clear.patch` adds opt-in `a5gpu=5`.
+It maps only 16 pages covering a 16×16 patch at `(528,944)` of the loader's
+physical DECON scanout buffer `0x67000000` into Mali AS0 and submits the same
+fragment clear with 4320-byte row stride and an opaque green value. The
+private `a5gpu=4` test stays available. The working 0132 BOOT was saved
+privately before only p10 was updated and the phone rebooted. The user saw the
+green square on the physical panel. The TWRP SYSTEM log recorded JS0 IRQ `1`,
+job-header exception `1` (DONE), and zero MMU, AS and GPU faults. This proves
+that a Mali fragment job can write pixels into the active DECON scanout buffer.
+The one-shot test does not provide CoreAnimation acceleration or ongoing frame
+presentation.
 
 ## What currently limits the screen
 
