@@ -90,8 +90,13 @@ mirrors the native Exynos7580 clock transition after BUCK4 is verified:
 temporarily slow both dividers to eight, select TOP with a bounded mux-status
 poll, select core /3 and peripheral /4, and check the final registers before
 powering cores. The transition is refused while any GPU core is already ready.
-This 0130 BOOT trial has been written to the phone; its runtime result is still
-pending.
+The 0130 device log confirms BUCK4 readback at 900 mV, TOP mux `1` and
+divider `0x32`, ready L2/shader/tiler masks `1/3/1`, and one completed private
+Mali `WRITE_VALUE` job: job IRQ `0x2`, MMU IRQ `0`, fault status `0`, and a
+64-bit sentinel changed to zero. The log also records SpringBoard and
+backboardd starting without a panic. This establishes an XNU Mali execution
+baseline. Fragment rendering, display buffer access, synchronization with
+CoreAnimation, and iOS graphics acceleration are still separate work.
 
 ## What currently limits the screen
 
