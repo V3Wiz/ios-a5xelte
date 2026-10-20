@@ -67,8 +67,21 @@ The code linked into an A5XELTE Mach-O and was packaged into a 20,283,408-byte
 BOOT candidate. The known local `dsymutil` `/dev/fd/62` restriction makes the
 full install target exit after link. Mac ADB confirmed the a5xelte TWRP and
 BOOT p10, saved the previous BOOT privately, wrote only p10, and rebooted.
-Per the user's preference, no post-write hash comparison was run.
-**Device execution of this job is pending.**
+Per the user's preference, no post-write hash comparison was run. The 0128
+SYSTEM log shows `GPU_ID=07201000`, available AS0/JS1, but `shader=0` and
+`l2=0`; the readiness gate correctly skipped submission. SpringBoard and
+backboardd still executed. TWRP separately reported the GPU regulator at
+787500 uV and disabled; this recovery observation is not a measurement of
+its state during XNU boot.
+
+Patch `0129-a5xelte-g3d-buck4-core-power.patch` reuses the established XNU
+HSI2C3 PMIC transfer path before touch takes ownership. It checks S2MPU03
+identity, reads BUCK4 selector and external-enable control, changes only the
+BUCK4 voltage selector to the Linux-verified 900 mV first OPP, and requires
+readback. It checks the inherited TOP clock mux and divider are no faster than
+133 MHz before powering L2, shader and tiler in Panfrost's order with bounded
+polls. A failure leaves the private GPU job unsubmitted. Success would prove
+only an isolated `WRITE_VALUE` job; iOS graphics would still use the CPU path.
 
 ## What currently limits the screen
 
