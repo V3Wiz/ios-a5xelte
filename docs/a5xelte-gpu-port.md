@@ -153,6 +153,8 @@ It remains a boot-time diagnostic, not an iOS frame queue.
 
 The queue ownership, fence semantics and route from IOSurface swaps to Mali
 are specified in [a5xelte-gpu-queue.md](a5xelte-gpu-queue.md).
+The installed iOS graphics interfaces and the current software frame path
+are mapped in [a5xelte-ios-gpu-integration.md](a5xelte-ios-gpu-integration.md).
 
 ## What currently limits the screen
 
