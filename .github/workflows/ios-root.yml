@@ -72,8 +72,10 @@ jobs:
       - name: Extract the D22AP device tree (for the ADT /product node)
         run: |
           set -euo pipefail
-          python3 -m pip install --quiet pyimg4
-          pyimg4 im4p extract -i ipsw/devicetree.im4p -o d22ap.adt
+          # Homebrew's Python is externally managed (PEP 668): use a venv.
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/python" -m pip install --quiet pyimg4
+          "$RUNNER_TEMP/venv/bin/pyimg4" im4p extract -i ipsw/devicetree.im4p -o d22ap.adt
           ls -l d22ap.adt
 
       - name: Stage the root volume
