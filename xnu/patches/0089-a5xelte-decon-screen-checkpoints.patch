@@ -1,6 +1,8 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 6958286..f365878 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -519,6 +519,22 @@
+@@ -519,6 +519,22 @@ LEXT(start_first_cpu)
  	MOV64	x11, 0x3145544c45554e58
  	str		x11, [x10]
  	dsb		sy
@@ -23,11 +25,10 @@
  #endif
  
  #if defined(SWEET) && !defined(A5XELTE)
-@@ -685,6 +701,28 @@
- 	/* Setup the KVA bootstrap mapping */
+@@ -686,6 +702,28 @@ Lkernelcache_base_found:
  	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
  	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
-+
+ 
 +#if defined(A5XELTE)
 +	/* Five 2 MiB blocks map the 1080x1920 scanout buffer VA=PA.
 +	 * Its L1 index differs from isolated XNU RAM, so this uses one extra
@@ -49,14 +50,14 @@
 +	subs	x13, x13, #1
 +	b.ne	La5_fb_attr
 +#endif
- 
++
  #if defined(SWEET) && !defined(A5XELTE)
  	/*
-@@ -844,6 +882,25 @@
- 	MOV64   x0, SCTLR_EL1_DEFAULT
+ 	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
+@@ -845,6 +883,25 @@ common_start:
  	MSR_SCTLR_EL1_X0
  	isb		sy
-+
+ 
 +#if defined(A5XELTE)
 +	/* Blue block: the 4 KiB MMU is active and the framebuffer alias works. */
 +	MOV64	x10, 0x6707ecc0
@@ -75,6 +76,7 @@
 +	b.ne	La5_mmu_row
 +	dsb		sy
 +#endif
- 
++
  #if !VMAPPLE && !defined(SWEET)
  	MOV64   x1, SCTLR_EL1_DEFAULT
+ 	cmp		x0, x1

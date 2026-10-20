@@ -1,3 +1,5 @@
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 17955fb..dcdbcf6 100644
 --- a/osfmk/arm64/sweet_early.c
 +++ b/osfmk/arm64/sweet_early.c
 @@ -8,11 +8,109 @@
@@ -114,9 +116,11 @@
  #elif defined(SWEET)
  #include <stdint.h>
  #include <kern/misc_protos.h>
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+index 19f27cd..ed7dccd 100644
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
-@@ -818,7 +818,11 @@
+@@ -818,7 +818,11 @@ fbcon_probe(void)
  	uint32_t const *val;
  	unsigned int size;
  

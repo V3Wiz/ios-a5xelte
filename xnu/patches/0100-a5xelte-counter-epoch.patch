@@ -1,6 +1,8 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 42362c5..195967c 100644
 --- a/osfmk/arm/arm_init.c
 +++ b/osfmk/arm/arm_init.c
-@@ -357,6 +357,13 @@ arm_init(
+@@ -358,6 +358,13 @@ arm_init(
  	BootArgs = args = &const_boot_args;
  
  	cpu_data_init(&BootCpuData);

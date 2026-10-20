@@ -1,6 +1,23 @@
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 68612db..deccec2 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7411,8 +7411,8 @@ process_signature(proc_t p, struct image_params *imgp)
+ 				error = EACCES;
+ 				goto done;
+ 			}
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
+-			/* SWEET runs every iOS binary this way: one short line per exec. */
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
++			/* A short line keeps the persistent console ring useful. */
+ 			printf("exec %s\n", p->p_name);
+ #else
+ 			printf("Allowing spawn of iOS binary %s since it has "
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index fde499c..a29409d 100644
 --- a/bsd/kern/kern_exit.c
 +++ b/bsd/kern/kern_exit.c
-@@ -1884,7 +1884,7 @@
+@@ -1884,7 +1884,7 @@ proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
  		subcode = ut->uu_subcode;
  		etype = ut->uu_exception;
  
@@ -9,9 +26,11 @@
  		if (p == current_proc()) {
  			extern void sweet_crash_log(const char *, int, int, uint64_t, uint64_t);
  			sweet_crash_log(p->p_comm, proc_getpid(p), WTERMSIG(rv),
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index a20a764..76d70b9 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -820,7 +820,7 @@
+@@ -820,7 +820,7 @@ exception_triage(
  	return exception_triage_thread(exception, code, codeCnt, thread);
  }
  
@@ -20,7 +39,7 @@
  #include <vm/vm_shared_region.h>
  #include <arm/thread.h>
  
-@@ -909,6 +909,9 @@
+@@ -909,6 +909,9 @@ static void
  sweet_crash_strings(const char *name)
  {
  	static char names[128];
@@ -30,7 +49,7 @@
  	char *buf;
  	vm_map_t map = current_map();
  	vm_map_offset_t addr = 0;
-@@ -935,6 +938,12 @@
+@@ -935,6 +938,12 @@ sweet_crash_strings(const char *name)
  	if (!found) {
  		return;
  	}
@@ -43,7 +62,7 @@
  	buf = kalloc_data(65536, Z_WAITOK);
  	if (buf == NULL) {
  		return;
-@@ -1040,7 +1049,7 @@
+@@ -1040,7 +1049,7 @@ sweet_sample_task(const char *name, int pid, task_t task)
  	task_unlock(task);
  }
  
@@ -52,16 +71,3 @@
  
  kern_return_t
  bsd_exception(
---- a/bsd/kern/kern_exec.c
-+++ b/bsd/kern/kern_exec.c
-@@ -7411,8 +7411,8 @@
- 				error = EACCES;
- 				goto done;
- 			}
--#if defined(ARM64_BOARD_CONFIG_SWEET)
--			/* SWEET runs every iOS binary this way: one short line per exec. */
-+#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
-+			/* A short line keeps the persistent console ring useful. */
- 			printf("exec %s\n", p->p_name);
- #else
- 			printf("Allowing spawn of iOS binary %s since it has "

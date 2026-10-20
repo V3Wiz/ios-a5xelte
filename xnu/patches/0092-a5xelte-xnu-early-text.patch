@@ -1,6 +1,8 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+index 5b66c3a..f7a54ac 100644
 --- a/osfmk/arm64/start.s
 +++ b/osfmk/arm64/start.s
-@@ -535,6 +535,11 @@
+@@ -535,6 +535,11 @@ La5_entry_pixel:
  	subs	x12, x12, #1
  	b.ne	La5_entry_row
  	dsb		sy
@@ -12,7 +14,7 @@
  #endif
  
  #if defined(SWEET) && !defined(A5XELTE)
-@@ -900,6 +905,13 @@
+@@ -900,6 +905,13 @@ La5_mmu_pixel:
  	subs	x12, x12, #1
  	b.ne	La5_mmu_row
  	dsb		sy
@@ -26,7 +28,7 @@
  #endif
  
  #if !VMAPPLE && !defined(SWEET)
-@@ -1081,6 +1093,58 @@
+@@ -1081,6 +1093,58 @@ arm_init_tramp:
  	/* Return to arm_init() */
  	ret
  

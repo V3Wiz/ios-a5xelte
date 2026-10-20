@@ -1,6 +1,8 @@
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+index 379e524..41ae356 100644
 --- a/bsd/dev/a5xelte_touch.c
 +++ b/bsd/dev/a5xelte_touch.c
-@@ -20,6 +20,7 @@
+@@ -20,6 +20,7 @@ void a5xelte_touch_probe(void);
  static vm_offset_t a5_touch_bus;
  static vm_offset_t a5_touch_alive;
  static int a5_touch_sleep;
@@ -8,7 +10,7 @@
  
  static uint16_t
  a5touch_le16(const uint8_t *bytes)
-@@ -45,11 +46,12 @@
+@@ -45,11 +46,12 @@ a5touch_write(vm_offset_t base, uint32_t offset, uint32_t value)
  
  /* Exynos7580 MIF HSI2C3 AUTO mode; 100 MHz source, conservative 100 kHz FS. */
  static void
@@ -23,7 +25,7 @@
  	a5touch_write(hsi, 0x60, 0x7b7b7b00u);
  	a5touch_write(hsi, 0x64, 0x3d007b7bu);
  	a5touch_write(hsi, 0x68, 0x000300f6u);
-@@ -71,7 +73,8 @@
+@@ -71,7 +73,8 @@ a5pmic_message(vm_offset_t hsi, bool receive, uint8_t *bytes,
  	}
  	a5touch_write(hsi, 0x24, a5touch_read(hsi, 0x24));
  	a5touch_write(hsi, 0x04, 0x00080083u);
@@ -33,7 +35,7 @@
  	a5touch_write(hsi, 0x00, ctl);
  	a5touch_write(hsi, 0x70, 0x66u << 10);
  	cfg = count | (receive ? 0x10000u : 0) | (stop ? 0x20000u : 0);
-@@ -81,8 +84,9 @@
+@@ -81,8 +84,9 @@ a5pmic_message(vm_offset_t hsi, bool receive, uint8_t *bytes,
  		uint32_t fifo = a5touch_read(hsi, 0x30);
  		uint32_t status = a5touch_read(hsi, 0x50);
  		if (status & 0x1eu) {
@@ -45,7 +47,7 @@
  			return false;
  		}
  		if (receive) {
-@@ -136,7 +140,14 @@
+@@ -136,7 +140,14 @@ a5touch_power_on(vm_offset_t mifpins)
  	a5touch_write(mifpins, 8, (old_pud & ~0xfu) | 0xfu);
  	a5touch_write(mifpins, 0, (old_con & ~0xffu) | 0x22u);
  	delay(100);

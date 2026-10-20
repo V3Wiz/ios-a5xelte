@@ -1,6 +1,8 @@
+diff --git a/pexpert/arm/pe_identify_machine.c b/pexpert/arm/pe_identify_machine.c
+index aa75c0a..842c40c 100644
 --- a/pexpert/arm/pe_identify_machine.c
 +++ b/pexpert/arm/pe_identify_machine.c
-@@ -551,6 +551,12 @@
+@@ -551,8 +551,14 @@ pe_arm_map_interrupt_controller(void)
  		kprintf("pe_arm_map_interrupt_controller: gTimerBase: 0x%lx\n", (unsigned long)gTimerBase);
  	}
  	if (gTimerBase == 0) {
@@ -13,3 +15,5 @@
  		return 0;
 +#endif
  	}
+ 
+ 	return 1;

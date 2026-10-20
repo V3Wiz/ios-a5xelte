@@ -1,3 +1,5 @@
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+index e561da9..7ba309b 100644
 --- a/bsd/dev/a5xelte_touch.c
 +++ b/bsd/dev/a5xelte_touch.c
 @@ -15,11 +15,18 @@
@@ -19,7 +21,7 @@
  
  static uint16_t
  a5touch_le16(const uint8_t *bytes)
-@@ -65,59 +72,102 @@
+@@ -65,59 +72,102 @@ a5pmic_message(vm_offset_t hsi, bool receive, uint8_t *bytes,
  {
  	uint32_t ctl;
  	uint32_t cfg;
@@ -70,10 +72,6 @@
  			}
 -		} else if (!(fifo & (1u << 7)) && done < count) {
 -			a5touch_write(hsi, 0x34, bytes[done++]);
--		}
--		if (done == count && (status & 1u)) {
--			printf("A5XELTE TOUCH: PMIC HSI2C complete rx=%d status=%#x irq=%#x\n",
--			    receive, status, a5touch_read(hsi, 0x24));
 +		} else {
 +			while (done < count && !(a5touch_read(hsi, 0x30) & (1u << 7))) {
 +				a5touch_write(hsi, 0x34, bytes[done++]);
@@ -81,7 +79,10 @@
 +			if (done == count) {
 +				a5touch_write(hsi, 0x20, 0xf80u);
 +			}
-+		}
+ 		}
+-		if (done == count && (status & 1u)) {
+-			printf("A5XELTE TOUCH: PMIC HSI2C complete rx=%d status=%#x irq=%#x\n",
+-			    receive, status, a5touch_read(hsi, 0x24));
 +		if (done == count && transfer_done) {
 +			a5touch_write(hsi, 0x20, 0);
 +			if (stop) {
@@ -144,7 +145,7 @@
  }
  
  static bool
-@@ -161,6 +211,7 @@
+@@ -161,6 +211,7 @@ a5touch_power_on(vm_offset_t mifpins)
  		goto fail;
  	}
  	printf("A5XELTE TOUCH: LDO33 enabled at 3.3 V, readback=%#x\n", check);
@@ -152,10 +153,11 @@
  	delay(15000);
  	return true;
  fail:
-@@ -298,10 +349,22 @@
+@@ -297,11 +348,23 @@ a5touch_chip_code_trial(vm_offset_t nfc)
+ 	a5touch_write(nfc, 8, old_pud);
  }
  
- static bool
++static bool
 +a5touch_send(uint8_t *data, unsigned length)
 +{
 +	for (unsigned attempt = 0; attempt < 8; attempt++) {
@@ -167,7 +169,7 @@
 +	return false;
 +}
 +
-+static bool
+ static bool
  a5touch_cmd(uint16_t reg)
  {
  	uint8_t data[2] = {(uint8_t)reg, (uint8_t)(reg >> 8)};
@@ -176,7 +178,7 @@
  	delay(20);
  	return ok;
  }
-@@ -311,7 +374,7 @@
+@@ -311,7 +374,7 @@ a5touch_write_reg(uint16_t reg, uint16_t value)
  {
  	uint8_t data[4] = {(uint8_t)reg, (uint8_t)(reg >> 8),
  	    (uint8_t)value, (uint8_t)(value >> 8)};
@@ -185,7 +187,7 @@
  	delay(20);
  	return ok;
  }
-@@ -320,7 +383,7 @@
+@@ -320,7 +383,7 @@ static bool
  a5touch_read_reg(uint16_t reg, uint8_t *data, unsigned length)
  {
  	uint8_t address[2] = {(uint8_t)reg, (uint8_t)(reg >> 8)};
@@ -194,7 +196,7 @@
  		return false;
  	}
  	delay(75); /* The ZT7538 requires STOP then at least 50 us. */
-@@ -351,67 +414,183 @@
+@@ -351,79 +414,131 @@ a5touch_sleep_5ms(void)
  	thread_block(THREAD_CONTINUE_NULL);
  }
  
@@ -273,8 +275,7 @@
 -						lines++;
 -					}
 -				}
--			}
-+			}
+ 			}
 +		} else if (idle_ticks < 600) {
 +			idle_ticks++;
 +		}
@@ -296,9 +297,6 @@
  
  static void
 -a5touch_start_early(vm_offset_t nfc, vm_offset_t alive)
--{
--	uint32_t con;
--	uint32_t pud;
 +a5touch_release_contacts(void)
 +{
 +	for (unsigned slot = 0; slot < 5; slot++) {
@@ -351,52 +349,33 @@
 +
 +static bool
 +a5touch_controller_init(void)
-+{
+ {
+-	uint32_t con;
+-	uint32_t pud;
  	uint16_t chip = 0;
  	uint16_t crc = 0;
  	uint16_t x = 0;
  	uint16_t y = 0;
-+	/* Native ZT7538 power-on sequence; abort on each failed transfer. */
-+	if (!a5touch_write_reg(0xc000, 1) ||
-+	    !a5touch_read_u16(0xcc00, &chip) || chip != 0xe538) {
-+		printf("A5XELTE TOUCH: chip-code failed value=%#x\n", chip);
-+		goto fail;
-+	}
-+	printf("A5XELTE TOUCH: ZT7538 chip-code=%#x\n", chip);
-+	if (!a5touch_cmd(0xc004) || !a5touch_write_reg(0xc002, 1)) {
-+		printf("A5XELTE TOUCH: firmware init sequence failed\n");
-+		goto fail;
-+	}
-+	delay(2000);
-+	if (!a5touch_write_reg(0xc001, 1)) {
-+		printf("A5XELTE TOUCH: program start failed\n");
-+		goto fail;
-+	}
-+	delay(150000);
-+	if (!a5touch_read_u16(0x012c, &crc) || crc != 0x55aau ||
-+	    !a5touch_read_u16(0x00c0, &x) || !a5touch_read_u16(0x00c1, &y)) {
-+		printf("A5XELTE TOUCH: firmware CRC/geometry failed crc=%#x x=%u y=%u\n",
-+		    crc, x, y);
-+		goto fail;
-+	}
-+	printf("A5XELTE TOUCH: firmware CRC=%#x geometry=%ux%u\n", crc, x, y);
-+	if (!a5touch_cmd(0x0000) || !a5touch_write_reg(0x00f0, 0) ||
-+	    !a5touch_write_reg(0x0010, 0) ||
-+	    !a5touch_write_reg(0x00f0, 0x003f)) {
-+		printf("A5XELTE TOUCH: mode 0 setup failed\n");
-+		goto fail;
-+	}
-+	for (unsigned n = 0; n < 10; n++) {
-+		if (!a5touch_cmd(0x0003)) {
-+			printf("A5XELTE TOUCH: interrupt queue ACK failed\n");
-+			goto fail;
-+		}
-+	}
-+	if (!a5touch_write_reg(0x00f1, 100)) {
-+		printf("A5XELTE TOUCH: heartbeat setup failed\n");
-+		goto fail;
-+	}
-+	printf("A5XELTE TOUCH: mode 0 ready, INTN=%u\n",
+-	thread_t thread;
+-	a5_touch_bus = ml_io_map(0x13850000, 0x1000);
+-	a5_touch_alive = alive;
+-	if (!a5_touch_bus) {
+-		printf("A5XELTE TOUCH: I2C2 mapping failed\n");
+-		return;
+-	}
+-	con = a5touch_read(nfc, 0);
+-	pud = a5touch_read(nfc, 8);
+-	a5touch_write(nfc, 8, (pud & ~0xfu) | 0xfu);
+-	a5touch_write(nfc, 0, (con & ~0xffu) | 0x22u);
+-	delay(100);
+ 	/* Native ZT7538 power-on sequence; abort on each failed transfer. */
+ 	if (!a5touch_write_reg(0xc000, 1) ||
+ 	    !a5touch_read_u16(0xcc00, &chip) || chip != 0xe538) {
+@@ -465,16 +580,39 @@ a5touch_start_early(vm_offset_t nfc, vm_offset_t alive)
+ 		goto fail;
+ 	}
+ 	printf("A5XELTE TOUCH: mode 0 ready, INTN=%u\n",
+-	    (unsigned)!!(a5touch_read(alive, 0x24) & 2u));
 +	    (unsigned)!!(a5touch_read(a5_touch_alive, 0x24) & 2u));
 +	return true;
 +fail:
@@ -408,55 +387,18 @@
 +{
 +	uint32_t con;
 +	uint32_t pud;
- 	thread_t thread;
- 	a5_touch_bus = ml_io_map(0x13850000, 0x1000);
- 	a5_touch_alive = alive;
-@@ -424,57 +603,16 @@
- 	a5touch_write(nfc, 8, (pud & ~0xfu) | 0xfu);
- 	a5touch_write(nfc, 0, (con & ~0xffu) | 0x22u);
- 	delay(100);
--	/* Native ZT7538 power-on sequence; abort on each failed transfer. */
--	if (!a5touch_write_reg(0xc000, 1) ||
--	    !a5touch_read_u16(0xcc00, &chip) || chip != 0xe538) {
--		printf("A5XELTE TOUCH: chip-code failed value=%#x\n", chip);
--		goto fail;
--	}
--	printf("A5XELTE TOUCH: ZT7538 chip-code=%#x\n", chip);
--	if (!a5touch_cmd(0xc004) || !a5touch_write_reg(0xc002, 1)) {
--		printf("A5XELTE TOUCH: firmware init sequence failed\n");
--		goto fail;
--	}
--	delay(2000);
--	if (!a5touch_write_reg(0xc001, 1)) {
--		printf("A5XELTE TOUCH: program start failed\n");
--		goto fail;
--	}
--	delay(150000);
--	if (!a5touch_read_u16(0x012c, &crc) || crc != 0x55aau ||
--	    !a5touch_read_u16(0x00c0, &x) || !a5touch_read_u16(0x00c1, &y)) {
--		printf("A5XELTE TOUCH: firmware CRC/geometry failed crc=%#x x=%u y=%u\n",
--		    crc, x, y);
--		goto fail;
--	}
--	printf("A5XELTE TOUCH: firmware CRC=%#x geometry=%ux%u\n", crc, x, y);
--	if (!a5touch_cmd(0x0000) || !a5touch_write_reg(0x00f0, 0) ||
--	    !a5touch_write_reg(0x0010, 0) ||
--	    !a5touch_write_reg(0x00f0, 0x003f)) {
--		printf("A5XELTE TOUCH: mode 0 setup failed\n");
--		goto fail;
--	}
--	for (unsigned n = 0; n < 10; n++) {
--		if (!a5touch_cmd(0x0003)) {
--			printf("A5XELTE TOUCH: interrupt queue ACK failed\n");
--			goto fail;
--		}
--	}
--	if (!a5touch_write_reg(0x00f1, 100)) {
--		printf("A5XELTE TOUCH: heartbeat setup failed\n");
--		goto fail;
--	}
--	printf("A5XELTE TOUCH: mode 0 ready, INTN=%u\n",
--	    (unsigned)!!(a5touch_read(alive, 0x24) & 2u));
++	thread_t thread;
++	a5_touch_bus = ml_io_map(0x13850000, 0x1000);
++	a5_touch_alive = alive;
++	if (!a5_touch_bus) {
++		printf("A5XELTE TOUCH: I2C2 mapping failed\n");
++		return;
++	}
++	con = a5touch_read(nfc, 0);
++	pud = a5touch_read(nfc, 8);
++	a5touch_write(nfc, 8, (pud & ~0xfu) | 0xfu);
++	a5touch_write(nfc, 0, (con & ~0xffu) | 0x22u);
++	delay(100);
 +	if (!a5touch_controller_init()) {
 +		a5touch_write(nfc, 0, con);
 +		a5touch_write(nfc, 8, pud);
@@ -466,13 +408,12 @@
  		thread_deallocate(thread);
  	} else {
 -		printf("A5XELTE TOUCH: logger thread start failed\n");
--	}
++		printf("A5XELTE TOUCH: contact thread start failed\n");
+ 	}
 -	return;
 -fail:
 -	a5touch_write(nfc, 0, con);
 -	a5touch_write(nfc, 8, pud);
-+		printf("A5XELTE TOUCH: contact thread start failed\n");
-+	}
  }
  
  void

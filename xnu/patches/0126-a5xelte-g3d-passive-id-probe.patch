@@ -1,4 +1,5 @@
 diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
+index ac54e10..0acd6ea 100644
 --- a/iokit/Kernel/arm/A5XELTEGPU.cpp
 +++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
 @@ -1,14 +1,13 @@
@@ -21,11 +22,10 @@ diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
   */
  #include <pexpert/arm64/board_config.h>
  
-@@ -16,6 +15,78 @@
- #include <IOKit/IOService.h>
+@@ -17,6 +16,78 @@
  #include <IOKit/IOLib.h>
  #include <pexpert/pexpert.h>
-+
+ 
 +/* The IOKit exported machine header omits these kernel-private mappings. */
 +extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern "C" void ml_io_unmap(vm_offset_t addr, vm_size_t size);
@@ -97,10 +97,11 @@ diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
 +    ml_io_unmap(cmu, 0x1000);
 +    ml_io_unmap(pmu, 0x1000);
 +}
- 
++
  class A5XELTEGPU : public IOService {
      OSDeclareDefaultStructors(A5XELTEGPU);
-@@ -30,7 +101,8 @@
+ 
+@@ -30,7 +101,8 @@ bool
  A5XELTEGPU::start(IOService *provider)
  {
      int enabled = 0;
@@ -110,7 +111,7 @@ diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
          return false; /* a5gpu=0, the safe default */
      }
      if (!IOService::start(provider)) {
-@@ -50,9 +122,12 @@
+@@ -50,9 +122,12 @@ A5XELTEGPU::start(IOService *provider)
      setProperty("A5G3DJobSPI", 282ULL, 32);
      setProperty("A5G3DMMUSPI", 283ULL, 32);
      setProperty("A5G3DGpuSPI", 281ULL, 32);

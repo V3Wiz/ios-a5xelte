@@ -1,3 +1,5 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index da59f72..6996772 100644
 --- a/iokit/Kernel/arm/SweetCPU.cpp
 +++ b/iokit/Kernel/arm/SweetCPU.cpp
 @@ -1,7 +1,7 @@
@@ -11,7 +13,7 @@
   */
  #include <pexpert/arm64/board_config.h>
  
-@@ -22,6 +22,9 @@
+@@ -22,6 +22,9 @@ extern "C" void sweet_secondary_entry(void);
  extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
  #if defined(A5XELTE)
  extern "C" void a5xelte_send_self_ipi(void);
@@ -21,7 +23,7 @@
  #endif
  
  class SweetCPU;
-@@ -76,16 +79,28 @@
+@@ -76,16 +79,28 @@ SweetCPU::start(IOService *provider)
  	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
  		return false;
  	}
@@ -52,7 +54,7 @@
  	if (cpuName == NULL) {
  		return false;
  	}
-@@ -104,10 +119,10 @@
+@@ -104,10 +119,10 @@ SweetCPU::start(IOService *provider)
  	perfmon_interrupt_handler_func pmi_handler = NULL;
  	kern_return_t result = ml_processor_register(&info, &machProcessor, &ipi_handler, &pmi_handler);
  	if (result != KERN_SUCCESS) {
@@ -65,7 +67,7 @@
  	}
  
  	registerService();
-@@ -117,7 +132,7 @@
+@@ -117,7 +132,7 @@ SweetCPU::start(IOService *provider)
  		thread_t thread;
  		result = kernel_thread_start(&SweetCPU::startAll, NULL, &thread);
  		if (result != KERN_SUCCESS) {
@@ -74,7 +76,7 @@
  		}
  		thread_deallocate(thread);
  	}
-@@ -131,7 +146,7 @@
+@@ -131,7 +146,7 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
  	const ml_topology_info_t *topology = ml_get_topology_info();
  	uint32_t requested = 1;
  	PE_parse_boot_argn("cpus", &requested, sizeof(requested));
@@ -83,7 +85,7 @@
  	    requested, topology->num_cpus, SWEET_SMP_MAX_CPUS);
  
  	uint64_t deadline;
-@@ -140,35 +155,35 @@
+@@ -140,35 +155,35 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
  		if (mach_absolute_time() > deadline) {
  			for (unsigned int i = 0; i < topology->num_cpus; i++) {
  				if (__atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE) == NULL) {
@@ -127,7 +129,7 @@
  		    i, topology->cpus[i].phys_id);
  	}
  	/* Publish exactly once, after every selected CPU has completed initCPU(). */
-@@ -176,7 +191,7 @@
+@@ -176,7 +191,7 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
  	__atomic_load_n(&sweet_cpus[topology->boot_cpu->cpu_id], __ATOMIC_ACQUIRE)->cpusRunning();
  	IOService::publishResource(gIOAllCPUInitializedKey, kOSBooleanTrue);
  	ml_set_max_cpus(topology->max_cpu_id + 1);
@@ -136,7 +138,7 @@
  	    topology->num_cpus, topology->num_cpus);
  	thread_terminate(current_thread());
  }
-@@ -192,7 +207,7 @@
+@@ -192,7 +207,7 @@ void
  SweetCPU::initCPU(bool boot)
  {
  	if (!boot) {
@@ -145,7 +147,7 @@
  	}
  	assert(cpu_number() == (int)getCPUNumber());
  
-@@ -203,7 +218,7 @@
+@@ -203,7 +218,7 @@ SweetCPU::initCPU(bool boot)
  	 * Waiting here with DAIF.I set would deadlock every secondary. */
  	signalCPU(this);
  	setCPUState(kIOCPUStateRunning);
@@ -154,7 +156,7 @@
  	    getCPUNumber(), __builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL,
  	    __builtin_arm_rsr64("CurrentEL") >> 2, ml_get_interrupts_enabled());
  	__atomic_store_n(&initialized, 1, __ATOMIC_RELEASE);
-@@ -221,13 +236,13 @@
+@@ -221,13 +236,13 @@ SweetCPU::signalCPU(IOCPU *target)
  	const ml_topology_info_t *topology = ml_get_topology_info();
  	unsigned int logical = target->getCPUNumber();
  	if (logical >= topology->num_cpus) {
@@ -170,7 +172,7 @@
  	}
  	uint64_t sgi = (((mpidr >> 32) & 0xff) << 48) |
  	    (((mpidr >> 16) & 0xff) << 32) |
-@@ -246,17 +261,17 @@
+@@ -246,17 +261,17 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
  	/* cpu_start() passes NULL,NULL: x20/x21 are set by LowResetVectorBase. */
  	if (start_paddr != 0 || arg_paddr != 0 || cpu->phys_id == 0 ||
  	    __atomic_load_n(&initialized, __ATOMIC_ACQUIRE) != 0) {
@@ -192,7 +194,7 @@
  	}
  	return KERN_SUCCESS;
  }
-@@ -264,13 +279,13 @@
+@@ -264,13 +279,13 @@ SweetCPU::startCPU(vm_offset_t start_paddr, vm_offset_t arg_paddr)
  void
  SweetCPU::quiesceCPU(void)
  {

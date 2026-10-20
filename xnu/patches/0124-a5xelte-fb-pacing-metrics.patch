@@ -1,6 +1,8 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 356ff51..7e2383c 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -118,6 +118,14 @@
+@@ -118,6 +118,14 @@ public:
  	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
  	bool          fDirty;
  	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
@@ -15,7 +17,7 @@
  	bool          fPowerOff;      /* RequestPowerChange(0) */
  	uint32_t      fFadeStep;      /* fade-out steps done while off */
  
-@@ -125,7 +133,7 @@
+@@ -125,7 +133,7 @@ public:
  	void addClient(IOMobileFramebufferUserClient *client);
  	void removeClient(IOMobileFramebufferUserClient *client);
  	void swap(const uint8_t *rec);
@@ -24,7 +26,7 @@
  };
  
  OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
-@@ -209,8 +217,31 @@
+@@ -209,8 +217,31 @@ AppleCLCD::start(IOService *provider)
  		return false;
  	}
  	uint32_t hz = 10;
@@ -56,7 +58,7 @@
  	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
  
  	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
-@@ -219,6 +250,10 @@
+@@ -219,6 +250,10 @@ AppleCLCD::start(IOService *provider)
  	registerService();
  	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
  	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
@@ -67,7 +69,7 @@
  	return true;
  }
  
-@@ -269,9 +304,44 @@
+@@ -269,9 +304,44 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
  	}
  	IOLockUnlock(fb->fLock);
  	if (rec != NULL) {
@@ -113,7 +115,7 @@
  	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
  }
  
-@@ -324,10 +394,11 @@
+@@ -324,10 +394,11 @@ AppleCLCD::swap(const uint8_t *rec)
  	}
  }
  
@@ -126,7 +128,7 @@
  
  
  	if (!fConsolePaused) {
-@@ -411,6 +482,7 @@
+@@ -411,6 +482,7 @@ AppleCLCD::present(const uint8_t *rec)
  			src = 0;
  		}
  		if (src != 0 && bpe == 4) {
@@ -134,7 +136,7 @@
  			for (int32_t y = 0; y < h; y++) {
  				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
  				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
-@@ -419,6 +491,7 @@
+@@ -419,6 +491,7 @@ AppleCLCD::present(const uint8_t *rec)
  		}
  		s->release();
  	}

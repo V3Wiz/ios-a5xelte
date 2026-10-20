@@ -1,23 +1,5 @@
---- a/iokit/KernelConfigTables.cpp
-+++ b/iokit/KernelConfigTables.cpp
-@@ -70,12 +70,16 @@
-     "     'IOProviderClass' = IOResources;"
-     "     'IOMatchCategory' = IOCoreSurfaceRoot;"
-     "   },"
--#if !defined(ARM64_BOARD_CONFIG_A5XELTE)
-     "   {"
-     "     'IOClass'         = AppleCLCD;"
-     "     'IOProviderClass' = IOPlatformDevice;"
-+#if defined(ARM64_BOARD_CONFIG_A5XELTE)
-+    "     'IONameMatch'     = 'samsung,a5xelte-display';"
-+#else
-     "     'IONameMatch'     = 'sweet,display';"
-+#endif
-     "   },"
-+#if !defined(ARM64_BOARD_CONFIG_A5XELTE)
-     "   {"
-     "     'IOClass'         = SweetHIDButtons;"
-     "     'IOProviderClass' = IOResources;"
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index c1ca075..a2daa87 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
 @@ -38,7 +38,7 @@
@@ -29,7 +11,7 @@
  #include <IOKit/IOService.h>
  #include <IOKit/IOUserClient.h>
  #include <IOKit/IOKitKeys.h>
-@@ -69,7 +69,11 @@
+@@ -69,7 +69,11 @@ enum {
  #define SWEET_FB_NOTIFY_TYPES           8
  #define SWEET_FB_NOTIFY_VSYNC           5
  #define SWEET_FB_VSYNC_US               16667
@@ -41,7 +23,7 @@
  /*
   * The iOS userland only has status bar / layout data for real iPhone
   * screens (UIKit: "No status bar visual provider for screen", the red
-@@ -158,10 +162,20 @@
+@@ -158,10 +162,20 @@ AppleCLCD::start(IOService *provider)
  		return false;
  	}
  	PE_current_console(&video);
@@ -62,7 +44,7 @@
  	if (fPhys == 0 || fWidth == 0 || fHeight == 0 || fRowBytes < fWidth * 4) {
  		IOLog("SWEET FB: no boot framebuffer\n");
  		return false;
-@@ -170,10 +184,12 @@
+@@ -170,10 +184,12 @@ AppleCLCD::start(IOService *provider)
  	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
  	fLogicalW = fWidth;
  	fLogicalH = fHeight;
@@ -75,7 +57,7 @@
  	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
  	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
  	fLock = IOLockAlloc();
-@@ -317,7 +333,11 @@
+@@ -317,7 +333,11 @@ AppleCLCD::present(const uint8_t *rec)
  	if (!fConsolePaused) {
  		int quiet = 0;
  		fConsolePaused = true;
@@ -87,15 +69,39 @@
  			/* Not PE_initialize_console(kPEDisableScreen): its console switch
  			 * writes the read-only-late cons_ops_index and panics. */
  			sweet_console_muted = 1;
-@@ -568,4 +588,4 @@
+@@ -568,4 +588,4 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
  	}
  	return ret;
  }
 -#endif /* ARM64_BOARD_CONFIG_SWEET */
 +#endif /* SWEET || A5XELTE */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index f81aa3d..f35a98d 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -70,12 +70,16 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = IOCoreSurfaceRoot;"
+     "   },"
+-#if !defined(ARM64_BOARD_CONFIG_A5XELTE)
+     "   {"
+     "     'IOClass'         = AppleCLCD;"
+     "     'IOProviderClass' = IOPlatformDevice;"
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++    "     'IONameMatch'     = 'samsung,a5xelte-display';"
++#else
+     "     'IONameMatch'     = 'sweet,display';"
++#endif
+     "   },"
++#if !defined(ARM64_BOARD_CONFIG_A5XELTE)
+     "   {"
+     "     'IOClass'         = SweetHIDButtons;"
+     "     'IOProviderClass' = IOResources;"
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index c86b9e7..d0322b5 100644
 --- a/osfmk/console/serial_console.c
 +++ b/osfmk/console/serial_console.c
-@@ -268,6 +268,8 @@
+@@ -268,6 +268,8 @@ _cnputc(char c, bool poll)
   */
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  extern void sweet_log_append(const char *c, int size);  /* bsd/dev/sweet_ufs.c */
@@ -104,7 +110,7 @@
  /*
   * Set by AppleCLCD (boot-arg sweetfb_noconsole=1) once the GUI presents:
   * console text still goes to the persistent log, but is not drawn over
-@@ -283,6 +285,8 @@
+@@ -283,6 +285,8 @@ _cnputs(char *c, int size, bool poll)
  
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  	sweet_log_append(c, size);

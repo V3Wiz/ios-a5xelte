@@ -1,3 +1,8 @@
+# Working on the HEROLTE port (Galaxy S7 SM-G930F, Exynos 8890)
+
+- Read `HEROLTE_PROGRESS.md` and `docs/herolte-bringup.md` first; record new device evidence in the former. The A5XELTE files below are the reference implementation this port adapts.
+- XNU trials may write only BOOT (`/dev/block/platform/155a0000.ufs/by-name/BOOT`). Keep the stock BOOT and a TWRP backup of EFS (IMEI) off the phone; never write EFS, RECOVERY or the bootloader partitions. Confirm every other partition write with the user first.
+
 # Working on the A5XELTE fork
 
 - For Samsung SM-A510F work, read `A5XELTE_PROGRESS.md` and `docs/a5xelte-migration-map.md` first. Record new device evidence in the former and commit completed changes. Keep private VM addresses, passwords, device dumps and downloaded Apple binaries out of git.

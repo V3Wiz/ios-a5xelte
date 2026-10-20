@@ -1,7 +1,8 @@
-diff --git a/xnu/bsd/dev/a5xelte_touch.c b/xnu/bsd/dev/a5xelte_touch.c
---- a/xnu/bsd/dev/a5xelte_touch.c
-+++ b/xnu/bsd/dev/a5xelte_touch.c
-@@ -20,7 +20,6 @@
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+index 41ae356..e561da9 100644
+--- a/bsd/dev/a5xelte_touch.c
++++ b/bsd/dev/a5xelte_touch.c
+@@ -20,7 +20,6 @@ void a5xelte_touch_probe(void);
  static vm_offset_t a5_touch_bus;
  static vm_offset_t a5_touch_alive;
  static int a5_touch_sleep;
@@ -9,14 +10,16 @@ diff --git a/xnu/bsd/dev/a5xelte_touch.c b/xnu/bsd/dev/a5xelte_touch.c
  
  static uint16_t
  a5touch_le16(const uint8_t *bytes)
-@@ -44,20 +43,19 @@
+@@ -44,20 +43,19 @@ a5touch_write(vm_offset_t base, uint32_t offset, uint32_t value)
  	__asm__ volatile("dsb osh" ::: "memory");
  }
  
 -/* Exynos7580 MIF HSI2C3 AUTO mode; 100 MHz source, conservative 100 kHz FS. */
--static void
++/* Exynos7580 MIF HSI2C3 AUTO mode, matching Linux's 400 kHz timing. */
+ static void
 -a5pmic_bus_init(vm_offset_t hsi, bool tenbit)
--{
++a5pmic_bus_init(vm_offset_t hsi)
+ {
 -	a5_pmic_tenbit = tenbit;
 -	a5touch_write(hsi, 0x00, 0x80000008u);
 -	a5touch_write(hsi, 0x00, 0x00000008u);
@@ -25,10 +28,6 @@ diff --git a/xnu/bsd/dev/a5xelte_touch.c b/xnu/bsd/dev/a5xelte_touch.c
 -	a5touch_write(hsi, 0x64, 0x3d007b7bu);
 -	a5touch_write(hsi, 0x68, 0x000300f6u);
 -	a5touch_write(hsi, 0x6c, 0x3du);
-+/* Exynos7580 MIF HSI2C3 AUTO mode, matching Linux's 400 kHz timing. */
-+static void
-+a5pmic_bus_init(vm_offset_t hsi)
-+{
 +	a5touch_write(hsi, 0x00, 0x80000009u);
 +	a5touch_write(hsi, 0x00, 0x00000009u);
 +	a5touch_write(hsi, 0x48, 0); /* Linux disables the hardware timeout. */
@@ -42,18 +41,18 @@ diff --git a/xnu/bsd/dev/a5xelte_touch.c b/xnu/bsd/dev/a5xelte_touch.c
  	a5touch_write(hsi, 0x20, 0); /* Poll without an unregistered XNU IRQ. */
  }
  
-@@ -72,20 +70,18 @@
+@@ -72,20 +70,18 @@ a5pmic_message(vm_offset_t hsi, bool receive, uint8_t *bytes,
  		return false;
  	}
  	a5touch_write(hsi, 0x24, a5touch_read(hsi, 0x24));
 -	a5touch_write(hsi, 0x04, 0x00080083u);
 -	ctl = 8u | (receive ? 0x40u : 0x80u) |
 -	    (a5_pmic_tenbit ? 0x40000000u : 0);
+-	a5touch_write(hsi, 0x00, ctl);
 +	a5touch_write(hsi, 0x04, 3u | (count << (receive ? 4 : 16)));
 +	ctl = 9u | (receive ? 0x40u : 0x80u);
-+	a5touch_write(hsi, 0x70, 0x66u << 10);
- 	a5touch_write(hsi, 0x00, ctl);
--	a5touch_write(hsi, 0x70, 0x66u << 10);
+ 	a5touch_write(hsi, 0x70, 0x66u << 10);
++	a5touch_write(hsi, 0x00, ctl);
  	cfg = count | (receive ? 0x10000u : 0) | (stop ? 0x20000u : 0);
 -	a5touch_write(hsi, 0x44, cfg);
  	a5touch_write(hsi, 0x44, cfg | 0x80000000u);
@@ -68,7 +67,7 @@ diff --git a/xnu/bsd/dev/a5xelte_touch.c b/xnu/bsd/dev/a5xelte_touch.c
  			    a5touch_read(hsi, 0x24), fifo);
  			return false;
  		}
-@@ -97,6 +93,8 @@
+@@ -97,6 +93,8 @@ a5pmic_message(vm_offset_t hsi, bool receive, uint8_t *bytes,
  			a5touch_write(hsi, 0x34, bytes[done++]);
  		}
  		if (done == count && (status & 1u)) {
@@ -77,7 +76,7 @@ diff --git a/xnu/bsd/dev/a5xelte_touch.c b/xnu/bsd/dev/a5xelte_touch.c
  			return true;
  		}
  		delay(1);
-@@ -140,14 +138,7 @@
+@@ -140,14 +138,7 @@ a5touch_power_on(vm_offset_t mifpins)
  	a5touch_write(mifpins, 8, (old_pud & ~0xfu) | 0xfu);
  	a5touch_write(mifpins, 0, (old_con & ~0xffu) | 0x22u);
  	delay(100);

@@ -1,34 +1,6 @@
-diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
---- a/iokit/KernelConfigTables.cpp
-+++ b/iokit/KernelConfigTables.cpp
-@@ -96,6 +96,14 @@
-     "     'IOMatchCategory' = SweetBattery;"
-     "   },"
- #endif
-+#if defined(ARM64_BOARD_CONFIG_A5XELTE)
-+    "   {"
-+    "     'IOClass'         = A5XELTEGPU;"
-+    "     'IOProviderClass' = IOPlatformDevice;"
-+    "     'IONameMatch'     = 'samsung,exynos7580-mali';"
-+    "     'IOProbeScore'    = 10000:32;"
-+    "   },"
-+#endif
- #endif
-     "   {"
-     "     'IOClass'         = IOPanicPlatform;"
-diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
---- a/iokit/conf/files.arm64
-+++ b/iokit/conf/files.arm64
-@@ -15,6 +15,7 @@
- iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
- iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
- iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
-+iokit/Kernel/arm/A5XELTEGPU.cpp                                 optional iokitcpp
- iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
- iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
- iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
 diff --git a/iokit/Kernel/arm/A5XELTEGPU.cpp b/iokit/Kernel/arm/A5XELTEGPU.cpp
 new file mode 100644
+index 0000000..ac54e10
 --- /dev/null
 +++ b/iokit/Kernel/arm/A5XELTEGPU.cpp
 @@ -0,0 +1,58 @@
@@ -90,3 +62,34 @@ new file mode 100644
 +    return true;
 +}
 +#endif /* ARM64_BOARD_CONFIG_A5XELTE */
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 9987f5a..2c3af25 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -96,6 +96,14 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
+ #endif
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++    "   {"
++    "     'IOClass'         = A5XELTEGPU;"
++    "     'IOProviderClass' = IOPlatformDevice;"
++    "     'IONameMatch'     = 'samsung,exynos7580-mali';"
++    "     'IOProbeScore'    = 10000:32;"
++    "   },"
++#endif
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index acc9ae0..4a5f5f4 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -15,6 +15,7 @@ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/A5XELTEGPU.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp

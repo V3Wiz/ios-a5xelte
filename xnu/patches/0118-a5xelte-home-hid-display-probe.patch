@@ -1,57 +1,8 @@
---- a/bsd/kern/syscalls.master
-+++ b/bsd/kern/syscalls.master
-@@ -650,7 +650,7 @@
- 432	AUE_NULL	ALL	{ int audit_session_port(au_asid_t asid, user_addr_t portnamep); }
- 433	AUE_NULL	ALL	{ int pid_suspend(int pid); }
- 434	AUE_NULL	ALL	{ int pid_resume(int pid); }
--#if CONFIG_EMBEDDED || defined(ARM64_BOARD_CONFIG_SWEET)
-+#if CONFIG_EMBEDDED || defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
- 435	AUE_NULL	ALL	{ int pid_hibernate(int pid); }
- #else
- 435     AUE_NULL        ALL     { int nosys(void); }
---- a/bsd/vm/vm_unix.c
-+++ b/bsd/vm/vm_unix.c
-@@ -1755,9 +1755,9 @@
- 	return error;
- }
- 
--#if !XNU_TARGET_OS_OSX || defined(ARM64_BOARD_CONFIG_SWEET)
-+#if !XNU_TARGET_OS_OSX || defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
- /*
-- * SWEET runs the iOS userland on the macOS config: SpringBoard calls
-+ * SWEET and A5XELTE run the iOS userland on the macOS config: SpringBoard calls
-  * pid_hibernate when an app leaves the foreground, and nosys (SIGSYS)
-  * killed it. Without CONFIG_FREEZE this returns 0, as on iOS.
-  */
-@@ -1822,7 +1822,7 @@
- 	*ret = error;
- 	return error;
- }
--#endif /* !XNU_TARGET_OS_OSX || SWEET */
-+#endif /* !XNU_TARGET_OS_OSX || SWEET || A5XELTE */
- 
- #if SOCKETS
- int
---- a/bsd/kern/kern_core.c
-+++ b/bsd/kern/kern_core.c
-@@ -117,11 +117,11 @@
-     thread_state_t tstate, mach_msg_type_number_t *count);
- void task_act_iterate_wth_args(task_t, void (*)(thread_t, void *), void *);
- 
--#if defined(SECURE_KERNEL) || defined(ARM64_BOARD_CONFIG_SWEET)
-+#if defined(SECURE_KERNEL) || defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
- /*
-- * SWEET: off by default (sysctl kern.coredump=1 enables it). A crashing iOS
-+ * iOS donor boards: off by default (sysctl kern.coredump=1 enables it). A crashing iOS
-  * daemon maps the whole shared region, so one core is gigabytes on the root
-- * volume and takes minutes on the phone's UFS.
-+ * volume and takes minutes on phone storage.
-  */
- __XNU_PRIVATE_EXTERN int do_coredump = 0;       /* default: don't dump cores */
- #else
+diff --git a/bsd/conf/files b/bsd/conf/files
+index eda6913..851addd 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -106,6 +106,8 @@
+@@ -106,6 +106,8 @@ bsd/dev/random/randomdev.c		standard
  bsd/dev/memdev.c			standard
  bsd/dev/sweet_ufs.c			standard
  bsd/dev/a5xelte_emmc.c			standard
@@ -60,6 +11,9 @@
  bsd/dev/sweet_sample.c			standard
  bsd/dev/sweet_keys.c			standard
  bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/a5xelte_keys.c b/bsd/dev/a5xelte_keys.c
+new file mode 100644
+index 0000000..3ba2fd4
 --- /dev/null
 +++ b/bsd/dev/a5xelte_keys.c
 @@ -0,0 +1,110 @@
@@ -173,6 +127,9 @@
 +	}
 +}
 +#endif
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+new file mode 100644
+index 0000000..e46d739
 --- /dev/null
 +++ b/bsd/dev/a5xelte_touch.c
 @@ -0,0 +1,58 @@
@@ -234,27 +191,86 @@
 +	}
 +}
 +#endif
---- a/iokit/KernelConfigTables.cpp
-+++ b/iokit/KernelConfigTables.cpp
-@@ -79,7 +79,6 @@
-     "     'IONameMatch'     = 'sweet,display';"
- #endif
-     "   },"
--#if !defined(ARM64_BOARD_CONFIG_A5XELTE)
-     "   {"
-     "     'IOClass'         = SweetHIDButtons;"
-     "     'IOProviderClass' = IOResources;"
-@@ -90,6 +89,7 @@
-     "     'IOProviderClass' = IOResources;"
-     "     'IOMatchCategory' = SweetHIDTouch;"
-     "   },"
-+#if !defined(ARM64_BOARD_CONFIG_A5XELTE)
-     "   {"
-     "     'IOClass'         = SweetBattery;"
-     "     'IOProviderClass' = IOResources;"
+diff --git a/bsd/kern/kern_core.c b/bsd/kern/kern_core.c
+index 2d5b6a3..d32c58d 100644
+--- a/bsd/kern/kern_core.c
++++ b/bsd/kern/kern_core.c
+@@ -117,11 +117,11 @@ kern_return_t thread_getstatus(thread_t act, int flavor,
+     thread_state_t tstate, mach_msg_type_number_t *count);
+ void task_act_iterate_wth_args(task_t, void (*)(thread_t, void *), void *);
+ 
+-#if defined(SECURE_KERNEL) || defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(SECURE_KERNEL) || defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ /*
+- * SWEET: off by default (sysctl kern.coredump=1 enables it). A crashing iOS
++ * iOS donor boards: off by default (sysctl kern.coredump=1 enables it). A crashing iOS
+  * daemon maps the whole shared region, so one core is gigabytes on the root
+- * volume and takes minutes on the phone's UFS.
++ * volume and takes minutes on phone storage.
+  */
+ __XNU_PRIVATE_EXTERN int do_coredump = 0;       /* default: don't dump cores */
+ #else
+diff --git a/bsd/kern/syscalls.master b/bsd/kern/syscalls.master
+index 422873e..1aabf8f 100644
+--- a/bsd/kern/syscalls.master
++++ b/bsd/kern/syscalls.master
+@@ -650,7 +650,7 @@
+ 432	AUE_NULL	ALL	{ int audit_session_port(au_asid_t asid, user_addr_t portnamep); }
+ 433	AUE_NULL	ALL	{ int pid_suspend(int pid); }
+ 434	AUE_NULL	ALL	{ int pid_resume(int pid); }
+-#if CONFIG_EMBEDDED || defined(ARM64_BOARD_CONFIG_SWEET)
++#if CONFIG_EMBEDDED || defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 435	AUE_NULL	ALL	{ int pid_hibernate(int pid); }
+ #else
+ 435     AUE_NULL        ALL     { int nosys(void); }
+diff --git a/bsd/vm/vm_unix.c b/bsd/vm/vm_unix.c
+index 636bd3d..399cd9a 100644
+--- a/bsd/vm/vm_unix.c
++++ b/bsd/vm/vm_unix.c
+@@ -1755,9 +1755,9 @@ out:
+ 	return error;
+ }
+ 
+-#if !XNU_TARGET_OS_OSX || defined(ARM64_BOARD_CONFIG_SWEET)
++#if !XNU_TARGET_OS_OSX || defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ /*
+- * SWEET runs the iOS userland on the macOS config: SpringBoard calls
++ * SWEET and A5XELTE run the iOS userland on the macOS config: SpringBoard calls
+  * pid_hibernate when an app leaves the foreground, and nosys (SIGSYS)
+  * killed it. Without CONFIG_FREEZE this returns 0, as on iOS.
+  */
+@@ -1822,7 +1822,7 @@ out:
+ 	*ret = error;
+ 	return error;
+ }
+-#endif /* !XNU_TARGET_OS_OSX || SWEET */
++#endif /* !XNU_TARGET_OS_OSX || SWEET || A5XELTE */
+ 
+ #if SOCKETS
+ int
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a2daa87..356ff51 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -555,6 +555,13 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	case kSweetFBRequestPowerChange:
+ 		if (args->scalarInputCount >= 1) {
+ 			bool off = args->scalarInput[0] == 0;
++#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++			int keep_on = 0;
++			if (off && PE_parse_boot_argn("a5fb_keep_on", &keep_on, sizeof(keep_on)) && keep_on) {
++				IOLog("A5XELTE FB: display-off request ignored (a5fb_keep_on)\n");
++				break;
++			}
++#endif
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 27bc49d..b1094e9 100644
 --- a/iokit/Kernel/arm/hid/SweetHID.cpp
 +++ b/iokit/Kernel/arm/hid/SweetHID.cpp
-@@ -434,14 +434,24 @@
+@@ -434,14 +434,24 @@ SweetHIDTouch::start(IOService *provider)
  	}
  	int native = 0;
  	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
@@ -279,7 +295,7 @@
  	gSweetTouch = this;
  	registerService();
  	IOLog("SWEET HID: touch registered\n");
-@@ -459,7 +469,7 @@
+@@ -459,7 +469,7 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
  		return;
  	}
  	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
@@ -288,7 +304,7 @@
  
  	IOLockLock(fLock);
  	bool was = fDown[finger];
-@@ -473,7 +483,7 @@
+@@ -473,7 +483,7 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
  	}
  	if (!was && down) {
  		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
@@ -297,25 +313,31 @@
  	}
  
  	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
---- a/iokit/Kernel/arm/SweetFramebuffer.cpp
-+++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -555,6 +555,13 @@
- 	case kSweetFBRequestPowerChange:
- 		if (args->scalarInputCount >= 1) {
- 			bool off = args->scalarInput[0] == 0;
-+#if defined(ARM64_BOARD_CONFIG_A5XELTE)
-+			int keep_on = 0;
-+			if (off && PE_parse_boot_argn("a5fb_keep_on", &keep_on, sizeof(keep_on)) && keep_on) {
-+				IOLog("A5XELTE FB: display-off request ignored (a5fb_keep_on)\n");
-+				break;
-+			}
-+#endif
- 			IOLockLock(fFB->fLock);
- 			if (off != fFB->fPowerOff) {
- 				fFB->fPowerOff = off;
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index f35a98d..9987f5a 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -79,7 +79,6 @@ const char * gIOKernelConfigTables =
+     "     'IONameMatch'     = 'sweet,display';"
+ #endif
+     "   },"
+-#if !defined(ARM64_BOARD_CONFIG_A5XELTE)
+     "   {"
+     "     'IOClass'         = SweetHIDButtons;"
+     "     'IOProviderClass' = IOResources;"
+@@ -90,6 +89,7 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetHIDTouch;"
+     "   },"
++#if !defined(ARM64_BOARD_CONFIG_A5XELTE)
+     "   {"
+     "     'IOClass'         = SweetBattery;"
+     "     'IOProviderClass' = IOResources;"
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 297c1ad..63a3c37 100644
 --- a/iokit/bsddev/IOKitBSDInit.cpp
 +++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -69,6 +69,8 @@
+@@ -69,6 +69,8 @@ extern int IODTGetDefault(const char *key, void *infoAddr, unsigned int infoSize
  extern boolean_t cpuid_vmm_present(void);
  #if defined(ARM64_BOARD_CONFIG_A5XELTE)
  extern void a5xelte_emmc_probe(void);
@@ -324,7 +346,7 @@
  #endif
  
  #define ROUNDUP(a, b) (((a) + ((b) - 1)) & (~((b) - 1)))
-@@ -770,6 +772,8 @@
+@@ -770,6 +772,8 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
  	}
  
  #if defined(ARM64_BOARD_CONFIG_A5XELTE)

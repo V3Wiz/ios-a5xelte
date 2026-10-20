@@ -1,5 +1,5 @@
 diff --git a/iokit/DriverKit/IORPC.h b/iokit/DriverKit/IORPC.h
-index 3ded78c59..c914e5634 100644
+index 3ded78c..c914e56 100644
 --- a/iokit/DriverKit/IORPC.h
 +++ b/iokit/DriverKit/IORPC.h
 @@ -224,6 +224,7 @@ struct IORPC {
@@ -11,7 +11,7 @@ index 3ded78c59..c914e5634 100644
  typedef struct IORPC IORPC;
  
 diff --git a/iokit/IOKit/IORPC.h b/iokit/IOKit/IORPC.h
-index 3ded78c59..c914e5634 100644
+index 3ded78c..c914e56 100644
 --- a/iokit/IOKit/IORPC.h
 +++ b/iokit/IOKit/IORPC.h
 @@ -224,6 +224,7 @@ struct IORPC {
@@ -23,7 +23,7 @@ index 3ded78c59..c914e5634 100644
  typedef struct IORPC IORPC;
  
 diff --git a/iokit/Kernel/IOUserServer.cpp b/iokit/Kernel/IOUserServer.cpp
-index 5d1d92267..e948a1e2f 100644
+index 5d1d922..e948a1e 100644
 --- a/iokit/Kernel/IOUserServer.cpp
 +++ b/iokit/Kernel/IOUserServer.cpp
 @@ -2382,6 +2382,7 @@ OSMetaClassBase::Invoke(IORPC rpc)

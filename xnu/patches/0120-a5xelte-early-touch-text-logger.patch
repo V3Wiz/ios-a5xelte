@@ -1,6 +1,8 @@
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+index 05d61ac..379e524 100644
 --- a/bsd/dev/a5xelte_touch.c
 +++ b/bsd/dev/a5xelte_touch.c
-@@ -1,18 +1,32 @@
+@@ -1,17 +1,31 @@
  /*
 - * Read-only Exynos7580 ZT7538 bring-up probe.  The working native Linux
 + * Early Exynos7580 ZT7538 bring-up probe.  The working native Linux
@@ -22,7 +24,7 @@
  extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern void thread_terminate_self(void);
 +void a5xelte_touch_probe(void);
- 
++
 +static vm_offset_t a5_touch_bus;
 +static vm_offset_t a5_touch_alive;
 +static int a5_touch_sleep;
@@ -32,11 +34,10 @@
 +{
 +	return (uint16_t)((unsigned)bytes[0] | ((unsigned)bytes[1] << 8));
 +}
-+
+ 
  static uint32_t
  a5touch_read(vm_offset_t base, uint32_t offset)
- {
-@@ -29,6 +43,130 @@
+@@ -29,6 +43,130 @@ a5touch_write(vm_offset_t base, uint32_t offset, uint32_t value)
  	__asm__ volatile("dsb osh" ::: "memory");
  }
  
@@ -167,7 +168,7 @@
  /* S3C2440 I2C2: one bounded message, with STOP between Zinitix phases. */
  static bool
  a5touch_wait_irq(vm_offset_t i2c)
-@@ -66,7 +204,7 @@
+@@ -66,7 +204,7 @@ a5touch_message(vm_offset_t i2c, bool receive, uint8_t *bytes, unsigned count)
  {
  	const uint32_t mode = receive ? 0x90u : 0xd0u;
  	bool ok = false;
@@ -176,7 +177,7 @@
  		return false;
  	}
  	for (unsigned n = 0; n < 5000; n++) {
-@@ -129,23 +267,27 @@
+@@ -129,23 +267,27 @@ static void
  a5touch_chip_code_trial(vm_offset_t nfc)
  {
  	vm_offset_t i2c = ml_io_map(0x13850000, 0x1000);
@@ -210,7 +211,7 @@
  	printf("A5XELTE TOUCH: I2C2 chip-code sent=%d received=%d value=%#x stat=%#x con=%#x\n",
  	    sent, got, (unsigned)code[0] | ((unsigned)code[1] << 8),
  	    a5touch_read(i2c, 4), a5touch_read(i2c, 0));
-@@ -153,25 +295,215 @@
+@@ -153,25 +295,215 @@ a5touch_chip_code_trial(vm_offset_t nfc)
  	a5touch_write(nfc, 8, old_pud);
  }
  
@@ -433,7 +434,7 @@
  	printf("A5XELTE TOUCH: INT GPA1 con=%#x dat=%#x; GPC3 con=%#x dat=%#x pud=%#x\n",
  	    a5touch_read(alive, 0x20), a5touch_read(alive, 0x24),
  	    a5touch_read(nfc, 0), a5touch_read(nfc, 4), a5touch_read(nfc, 8));
-@@ -186,9 +518,12 @@
+@@ -186,9 +518,12 @@ a5xelte_touch_probe(void)
  			    a5touch_read(i2c, 0), a5touch_read(i2c, 4),
  			    a5touch_read(i2c, 8), a5touch_read(i2c, 0x10));
  		}

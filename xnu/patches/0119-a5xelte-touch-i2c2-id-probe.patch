@@ -1,3 +1,5 @@
+diff --git a/bsd/dev/a5xelte_touch.c b/bsd/dev/a5xelte_touch.c
+index e46d739..05d61ac 100644
 --- a/bsd/dev/a5xelte_touch.c
 +++ b/bsd/dev/a5xelte_touch.c
 @@ -1,12 +1,13 @@
@@ -16,7 +18,7 @@
  #include <machine/machine_routines.h>
  #include <pexpert/pexpert.h>
  
-@@ -20,6 +21,138 @@
+@@ -20,6 +21,138 @@ a5touch_read(vm_offset_t base, uint32_t offset)
  	return value;
  }
  
@@ -155,7 +157,7 @@
  void
  a5xelte_touch_probe(void)
  {
-@@ -53,6 +186,11 @@
+@@ -53,6 +186,11 @@ a5xelte_touch_probe(void)
  			    a5touch_read(i2c, 0), a5touch_read(i2c, 4),
  			    a5touch_read(i2c, 8), a5touch_read(i2c, 0x10));
  		}
