@@ -44,5 +44,14 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   **El kernel HEROLTE todavía no se compiló**: Actions pendiente.
 - `shim/herolte/xnu_boot` (loader) y `tools/mkadt_herolte.py` escritos y
   compilados/ejecutados localmente; sin prueba en el teléfono.
-- Pendiente: foto del probe; fork en GitHub con Actions; reescribir
-  `0106`/`0107`; nodo `/product` del ADT a partir del IPSW.
+- `0106`/`0107` reescritos como `0201-herolte-amfi-bridge` y
+  `0202-herolte-4k-unsigned-dyld-cache`; 125 parches aplican en orden.
+- **Primer kernel HEROLTE compilado en Actions** (fork `wardevsa/ios-a5xelte`,
+  rama `herolte`, run 39477885586, commit fb6194b): artefacto `xnu-kernel`
+  de 61 MB. El chequeo de LSE encontró una sola coincidencia, dentro de
+  `K256` (constantes de SHA-256 en `__TEXT`), es decir, datos: el código del
+  kernel no tiene atómicas LSE. El chequeo ahora ignora `K256`.
+- Actions publica los errores de compilación como anotaciones públicas
+  (los logs requieren sesión de GitHub).
+- Pendiente: probar `xnu-boot.img` en el teléfono; nodo `/product` del ADT
+  a partir del IPSW.
