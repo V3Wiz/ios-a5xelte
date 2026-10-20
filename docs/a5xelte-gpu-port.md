@@ -106,7 +106,17 @@ then checks that all 256 pixels become opaque red. It records job, MMU and GPU
 fault registers and the first/last pixels. No display buffer is mapped and no
 iOS rendering API is wired to this path. The 20,283,408-byte BOOT image was
 linked, packaged, written only to BOOT p10 after saving the working 0130 BOOT,
-and booted. Physical device outcome awaits the TWRP SYSTEM log readback.
+and booted. The phone's SYSTEM log recorded JS0 IRQ `0x10000`, status `0x58`
+(`DATA_INVALID_FAULT` in Panfrost), no MMU fault, and `0/256` red pixels.
+SpringBoard and backboardd still executed. This is a failed fragment job, not
+proof of rendered pixels.
+
+Patch `0132-a5xelte-g3d-page-aligned-polygon-list.patch` gives the polygon
+list its own 4 KiB-aligned page and moves the output to a separate page, as
+Mesa's independent polygon BO allocation does. It also logs the job header's
+exception and fault pointer plus GPU fault address/status. The 0132 BOOT was
+linked and written only to p10. Its result awaits the next device log. The
+alignment difference is a testable hypothesis, not a confirmed root cause.
 
 ## What currently limits the screen
 
