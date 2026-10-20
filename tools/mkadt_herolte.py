@@ -36,16 +36,14 @@ def child(node, name):
 
 def build():
     root = mkadt.build(seed=os.urandom(64), qemu=True)
+    # The userland is the iPhone X IPSW (iPhone10,3 / D22AP), like the donor:
+    # compatible[0] is hw.model/hw.target, model is hw.machine. The donor's
+    # /buttons stays (home-button-type 2: gesture navigation, no Home key).
     # 'samsung,a5xelte' keeps the shared SweetPlatformExpert IONameMatch.
-    set_prop(root, 'compatible', mkadt.cstr('samsung,herolte') +
-             mkadt.cstr('samsung,exynos8890') + mkadt.cstr('samsung,a5xelte') +
-             mkadt.cstr('AppleARM'))
+    set_prop(root, 'compatible', mkadt.cstr('D22AP') + mkadt.cstr('iPhone10,3') +
+             mkadt.cstr('samsung,a5xelte') + mkadt.cstr('samsung,herolte') +
+             mkadt.cstr('samsung,exynos8890') + mkadt.cstr('AppleARM'))
     chosen = child(root, 'chosen')
-    buttons = child(root, 'buttons')
-    # GPA0-5 mechanical Home key (exynos8890-herolte_common.dtsi).
-    set_prop(buttons, 'home-button-type', mkadt.u32(0))
-    set_prop(buttons, 'button-names', b''.join(mkadt.cstr(name) for name in
-                                       ('volup', 'voldown', 'hold', 'home')))
     set_prop(chosen, 'dram-base', mkadt.u64(DRAM_BASE))
     set_prop(chosen, 'dram-size', mkadt.u64(DRAM_SIZE))
     set_prop(chosen, 'firmware-version', mkadt.cstr('herolte-entry'))
