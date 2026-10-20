@@ -144,8 +144,12 @@ ambiguous result halts further submissions and keeps GPU-visible pages pinned.
 The kernel linked successfully; the build wrapper reported only its known
 post-link `dsymutil` file-descriptor permission failure. The 0134 image was
 written to BOOT p10 without creating a new BOOT backup at the user's request,
-and the device was rebooted. Hardware fence results are still pending the
-TWRP SYSTEM log. This remains a boot-time diagnostic, not an iOS frame queue.
+and the device was rebooted. The TWRP SYSTEM log recovered 30,933 bytes from
+this boot. It recorded `fence=1` and `fence=2`, each with JS0 IRQ `1`, job
+header DONE `1`, `256/256` matching pixels, an idle slot and no MMU/GPU
+fault. XNU then reported `4/4 CPUs initialized`; the captured log has no
+panic. This proves ordered execution of these two private jobs on the phone.
+It remains a boot-time diagnostic, not an iOS frame queue.
 
 The queue ownership, fence semantics and route from IOSurface swaps to Mali
 are specified in [a5xelte-gpu-queue.md](a5xelte-gpu-queue.md).
