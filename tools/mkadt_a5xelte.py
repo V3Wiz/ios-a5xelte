@@ -100,7 +100,11 @@ def build():
         ('reg', mkadt.u64(0x01400000, 0x5000)),
         ('cmu-reg', mkadt.u64(0x01460000, 0x1000)),
         ('pmu-reg', mkadt.u64(0x00460000, 0x5000)),
-        ('interrupts', mkadt.u32(282, 283, 281)),  # JOB, MMU, GPU
+        # The stage-1 service does not request interrupts. Publishing an
+        # `interrupts` cell here without a matching ADT interrupt parent
+        # makes IODTGetICellCounts repeatedly warn during nub creation.
+        # JOB/MMU/GPU SPIs 282/283/281 remain service properties until an
+        # actual GIC-backed handler is implemented.
     ]))
     root.children = [n for n in root.children if n.prop('name') not in
                      (mkadt.cstr('sweet-fbcon'), mkadt.cstr('sweet-ufs'))]

@@ -10,7 +10,8 @@ Patch `xnu/patches/0125-a5xelte-g3d-resource-service.patch` adds the
 `A5XELTEGPU` IOKit service, and `tools/mkadt_a5xelte.py` supplies its
 `/arm-io/gpu` nub. The service is disabled unless `a5gpu=1` is explicitly in
 the BOOT command line. Even when enabled, it only publishes the exact physical
-resource addresses and GIC SPI numbers listed below. It has no MMIO map,
+resource addresses and GIC SPI numbers listed below. The ADT nub omits an
+`interrupts` property until a controller parent and real handler exist. It has no MMIO map,
 power/clock/regulator writes, GPU interrupt handler or user client. Therefore
 it cannot alter framebuffer performance yet. It is a compile and matching
 foundation for the next hardware stage, with the existing CPU display path
@@ -20,6 +21,36 @@ The ADT node and IOKit service are separate: seeing `gpu` in the device tree
 does not prove the service matched, and seeing `A5XELTE G3D: resource service
 registered` would prove only registration. The service compiled and linked,
 but has not yet been packaged into BOOT or tested on the phone.
+
+## Stage-2 passive probe candidate
+
+Patch `0126-a5xelte-g3d-passive-id-probe.patch` adds a separate, explicit
+`a5gpu=2` diagnostic mode. It first reads only PMU G3D status at
+`0x10464064`. Unless its low nibble is `0xf`, it leaves the G3D clock and GPU
+apertures untouched. If powered, it reads the native G3D CMU clock gates at
+`0x11460800` and `0x11460900`; unless bits 0, 1 and 4 are set in both, it
+does not read the GPU. It checks PMU status again immediately before mapping
+GPU_ID at `0x11400000`, then decodes product bits 31:16 (`0x720` is expected
+for Mali-T720). Each outcome is recorded as `A5G3DProbeResult` in IORegistry.
+No register writes or GPU jobs are performed. `a5gpu=1` remains resource-only,
+and absent/`a5gpu=0` remains disabled. The CPU display path stays active.
+
+This probe can identify an *already powered and clocked* GPU; it cannot power
+one on. The native Linux driver requires a live TOP bus parent rate, MIF/INT
+interconnect votes, S2MPU03 BUCK4 voltage/enable sequencing, PMU domain
+power-on and CMU divider/mux/gate programming. The XNU port has no coordinated
+provider for BUCK4 or these bus clocks. Its touch driver owns the PMIC I²C
+path, so an independent GPU-side PMIC write would also need bus serialization.
+Without verified voltage and bus floors, copying Linux's PMU/CMU writes risks
+an undervoltage fault or an external abort. Keep active power-on and job
+submission out of `0126`. On the phone, the corrected ADT let the resource
+service register and the passive probe printed `GPU_ID=07201000`, product
+`0720`. This demonstrates a readable, already-powered Mali-T720 register at
+that instant; no GPU job has run. The probe then panicked in `vm_map_delete`
+when `ml_io_unmap` tried to remove the permanent mapping created by
+`ml_io_map`. Patch `0127` switches those three short-lived maps to XNU's
+`ml_io_map_unmappable`, matching the later `ml_io_unmap` calls. The 0127
+runtime result remains to be checked.
 
 ## What currently limits the screen
 
@@ -34,6 +65,12 @@ limit can improve visible update cadence, but it does not run icon composition
 or any other rendering work on the Mali GPU. Measure copy duration and CPU
 cost before choosing a higher default; a 1080 x 1920 XRGB8888 full frame is
 8,294,400 bytes.
+
+The 0124 phone log measured 23 present calls in 63.857 seconds (0.36/s)
+despite the effective 30 Hz cap. Full-frame CPU copies commonly took about
+5–6 ms and at most 11.6 ms in that interval. These data show the cap alone
+and the final memcpy are not the observed source of the very low frame rate;
+they do not yet identify the time spent rendering or restarting services.
 
 `xnu/iokit/Kernel/arm/SweetSurface.cpp` maps the physical display surface
 write-combined and currently accepts accelerator/shared-event methods without
