@@ -97,6 +97,17 @@ backboardd starting without a panic. This establishes an XNU Mali execution
 baseline. Fragment rendering, display buffer access, synchronization with
 CoreAnimation, and iOS graphics acceleration are still separate work.
 
+Patch `0131-a5xelte-g3d-private-fragment-clear.patch` adds a second opt-in
+test, `a5gpu=4`, based on Mesa 26.2.4 Panfrost's Midgard v4 descriptor layout.
+It submits one fragment job on JS0 against four private Mali-mapped pages: a
+16×16 linear RGBA8 target, a single-target framebuffer descriptor, and the
+T720 empty polygon list. The kernel fills the target with a sentinel first,
+then checks that all 256 pixels become opaque red. It records job, MMU and GPU
+fault registers and the first/last pixels. No display buffer is mapped and no
+iOS rendering API is wired to this path. The 20,283,408-byte BOOT image was
+linked, packaged, written only to BOOT p10 after saving the working 0130 BOOT,
+and booted. Physical device outcome awaits the TWRP SYSTEM log readback.
+
 ## What currently limits the screen
 
 `xnu/iokit/Kernel/arm/SweetFramebuffer.cpp` is the inherited AppleCLCD bridge.
