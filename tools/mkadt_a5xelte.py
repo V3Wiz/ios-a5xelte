@@ -91,6 +91,17 @@ def build():
         ('canvas-width', mkadt.u32(1080)),
         ('canvas-height', mkadt.u32(1920)),
     ]))
+    # Stage-1 G3D resource nub. The matching XNU service is off unless
+    # a5gpu=1 and never maps or powers the GPU in this stage. Addresses below
+    # are relative to the arm-io range base 0x10000000, just like the GIC.
+    arm_io.children.append(mkadt.node('gpu', [
+        ('device_type', mkadt.cstr('gpu')),
+        ('compatible', mkadt.cstr('samsung,exynos7580-mali')),
+        ('reg', mkadt.u64(0x01400000, 0x5000)),
+        ('cmu-reg', mkadt.u64(0x01460000, 0x1000)),
+        ('pmu-reg', mkadt.u64(0x00460000, 0x5000)),
+        ('interrupts', mkadt.u32(282, 283, 281)),  # JOB, MMU, GPU
+    ]))
     root.children = [n for n in root.children if n.prop('name') not in
                      (mkadt.cstr('sweet-fbcon'), mkadt.cstr('sweet-ufs'))]
     root.children.append(mkadt.node('a5xelte-fbcon', [
