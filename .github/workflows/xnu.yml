@@ -170,27 +170,27 @@ jobs:
           test -f "$kernel"
           xcrun llvm-objdump -d --no-show-raw-insn "$kernel" > lse-scan.txt || {
             echo "::error title=LSE check::llvm-objdump failed on $kernel"; exit 1; }
-          pattern='[[:space:]](cas|casp|ldadd|ldclr|ldeor|ldset|ldsmax|ldsmin|ldumax|ldumin|stadd|stclr|steor|stset|stsmax|stsmin|stumax|stumin|swp)[a-z]*[[:space:]]'
-          count=$(grep -cE "$pattern" lse-scan.txt || true)
-          echo "LSE instructions in $kernel: $count"
-          if [ "$count" != 0 ]; then
-            # Which functions hold them, as a public annotation (see Build).
-            python3 - lse-scan.txt "$count" <<'PY'
+          # Fails only on LSE inside code; constant tables in __TEXT that
+          # disassemble as LSE (K256, SHA-256 round constants) are data.
+          python3 - lse-scan.txt "$kernel" <<'PY'
           import re, sys
           lse = re.compile(r'\s(cas|casp|ldadd|ldclr|ldeor|ldset|ldsmax|ldsmin|ldumax|ldumin|stadd|stclr|steor|stset|stsmax|stsmin|stumax|stumin|swp)[a-z]*\s')
+          data_symbols = {'K256'}
           func, funcs, samples = '?', {}, []
           for line in open(sys.argv[1], errors='replace'):
               m = re.match(r'^[0-9a-f]+ <(.+)>:', line)
               if m:
                   func = m.group(1)
-              elif lse.search(line):
+              elif lse.search(line) and func not in data_symbols:
                   funcs[func] = funcs.get(func, 0) + 1
                   if len(samples) < 8:
                       samples.append(func + ': ' + line.strip())
-          top = sorted(funcs.items(), key=lambda kv: -kv[1])[:40]
-          msg = f'{sys.argv[2]} LSE instructions in {len(funcs)} functions\n'
-          msg += '\n'.join(f'{n} {f}' for f, n in top) + '\n--\n' + '\n'.join(samples)
-          print('::error title=LSE in kernel::' + msg.replace('%', '%25').replace('\n', '%0A'))
+          count = sum(funcs.values())
+          print(f'LSE instructions in code of {sys.argv[2]}: {count}')
+          if count:
+              top = sorted(funcs.items(), key=lambda kv: -kv[1])[:40]
+              msg = f'{count} LSE instructions in {len(funcs)} functions\n'
+              msg += '\n'.join(f'{n} {f}' for f, n in top) + '\n--\n' + '\n'.join(samples)
+              print('::error title=LSE in kernel::' + msg.replace('%', '%25').replace('\n', '%0A'))
+              sys.exit(1)
           PY
-          fi
-          test "$count" = 0
