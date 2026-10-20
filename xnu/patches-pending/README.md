@@ -6,8 +6,11 @@ reescribirlos a mano antes de moverlos de vuelta.
 
 | Parche | Para HEROLTE |
 | --- | --- |
-| 0106 amfi-bridge | **Necesario** para ejecutar launchd (interfaz AMFI integrada) |
-| 0107 4k-unsigned-dyld-cache | **Necesario** para cargar la shared cache de 16 KiB con páginas de 4 KiB |
 | 0112, 0113, 0115 SMP | Más adelante (arrancar con `cpus=1`) |
 | 0116 container-entitlement-trace | Diagnóstico, opcional |
 | 0129–0134 G3D | Específicos de la Mali-T720 del A5; no aplican al S7 |
+
+`0106` (AMFI) y `0107` (shared cache de 16 KiB en páginas de 4 KiB) se
+reescribieron como `xnu/patches/0201-herolte-amfi-bridge.patch` y
+`xnu/patches/0202-herolte-4k-unsigned-dyld-cache.patch`, que valen para
+A5XELTE y HEROLTE.
