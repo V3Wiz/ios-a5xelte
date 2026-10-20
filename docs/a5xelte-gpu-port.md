@@ -1,9 +1,8 @@
 # A5XELTE GPU port: measured boundary and implementation order
 
-Status: the phone has registered the GPU service and read Mali-T720
-`GPU_ID=07201000`. Patch `0128` is a linked candidate flashed to BOOT p10 for
-one offscreen GPU write; its runtime result is pending. No completed GPU job, iOS GPU API bridge, or
-GPU-rendered SpringBoard frame has been observed on this port.
+Status: the phone reads Mali-T720 `GPU_ID=07201000` and patch `0130` has
+completed one isolated GPU memory write with no MMU fault. An iOS GPU API
+bridge and GPU-rendered SpringBoard frames have not been observed.
 
 ## Stage-1 code candidate
 
