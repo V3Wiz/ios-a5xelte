@@ -1,7 +1,8 @@
 # A5XELTE GPU port: measured boundary and implementation order
 
-Status: source audit and patch `0125` resource service linked into the A5XELTE
-Mach-O. No GPU power-on, Mali register read, GPU job, iOS GPU API bridge, or
+Status: the phone has registered the GPU service and read Mali-T720
+`GPU_ID=07201000`. Patch `0128` is a linked candidate flashed to BOOT p10 for
+one offscreen GPU write; its runtime result is pending. No completed GPU job, iOS GPU API bridge, or
 GPU-rendered SpringBoard frame has been observed on this port.
 
 ## Stage-1 code candidate
@@ -19,8 +20,7 @@ untouched. `a5gpu=0` (or absent) makes the service decline to start.
 
 The ADT node and IOKit service are separate: seeing `gpu` in the device tree
 does not prove the service matched, and seeing `A5XELTE G3D: resource service
-registered` would prove only registration. The service compiled and linked,
-but has not yet been packaged into BOOT or tested on the phone.
+registered` proves only registration.
 
 ## Stage-2 passive probe candidate
 
@@ -49,8 +49,26 @@ service register and the passive probe printed `GPU_ID=07201000`, product
 that instant; no GPU job has run. The probe then panicked in `vm_map_delete`
 when `ml_io_unmap` tried to remove the permanent mapping created by
 `ml_io_map`. Patch `0127` switches those three short-lived maps to XNU's
-`ml_io_map_unmappable`, matching the later `ml_io_unmap` calls. The 0127
-runtime result remains to be checked.
+`ml_io_map_unmappable`, matching the later `ml_io_unmap` calls. The phone's
+0127 SYSTEM log contains the expected GPU ID, SpringBoard and backboardd
+execs, and framebuffer timing samples without a repeated `vm_map_delete`
+panic. It still says `no GPU jobs`.
+
+## Stage-3 offscreen job candidate
+
+Patch `0128-a5xelte-g3d-offscreen-write-value.patch` adds opt-in `a5gpu=3`.
+Only after the existing PMU/CMU/ID checks, it checks shader/L2 readiness,
+JS1 and unused AS0, allocates a private physically contiguous buffer, installs
+four-level Mali page tables, and submits one `WRITE_VALUE` job into a private
+8-byte output. It uses finite polls for MMU update and job completion and
+reports the fault registers and output. It does not address the display buffer,
+wire GPU interrupts, expose an iOS user client, or replace the CPU compositor.
+The code linked into an A5XELTE Mach-O and was packaged into a 20,283,408-byte
+BOOT candidate. The known local `dsymutil` `/dev/fd/62` restriction makes the
+full install target exit after link. Mac ADB confirmed the a5xelte TWRP and
+BOOT p10, saved the previous BOOT privately, wrote only p10, and rebooted.
+Per the user's preference, no post-write hash comparison was run.
+**Device execution of this job is pending.**
 
 ## What currently limits the screen
 
@@ -59,8 +77,8 @@ It describes the CoreAnimation CPU renderer, holds the latest swap record,
 copies IOSurface rectangles with the CPU to the DECON scanout buffer at
 `0x67000000`, and emits a 60 Hz timer notification. Its default
 `sweetfb_hz=10` permitted a panel copy only every sixth timer tick. Patch `0124`
-sets an A5XELTE default of 30 Hz and records actual cadence and copy cost;
-its phone result is pending. Raising the
+sets an A5XELTE default of 30 Hz and records actual cadence and copy cost.
+Raising the
 limit can improve visible update cadence, but it does not run icon composition
 or any other rendering work on the Mali GPU. Measure copy duration and CPU
 cost before choosing a higher default; a 1080 x 1920 XRGB8888 full frame is
