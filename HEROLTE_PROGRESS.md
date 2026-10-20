@@ -93,4 +93,14 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   TEST UNIT READY 0; `READ(10) LBA1 0, signature EFI PART`; GPT de 128
   entradas de 128 bytes en LBA 2; particiones p1 `BOTA0` … p17 `USERDATA`
   (~21,5 GB, bloques de 4 KiB). Primera lectura del UFS desde XNU.
+- **Primer root montado desde UFS.** Volumen HFSX de 32 MiB
+  (`hfs-test-image`, sha256 `043f1459…8b94`) escrito por adb/TWRP al inicio
+  de USERDATA (`/dev/block/sda18`); BOOT con `rd=ufsroot0 ufsroot=USERDATA
+  cs_enforcement_disable=1` (mismo kernel `869c4c5f…`); ambos verificados por
+  readback. Foto: `"USERDATA" on LUN 0: first block 0x22e0ac, 21566 MiB,
+  read-only`, `BSD root: ufsroot0, major 1, minor 0`, `hfs: mounted HEROTEST
+  on device b(1, 0)`, `root volume is not authenticated (error 25);
+  continuing unsealed`, `devfs_kernel_mount: kernel_mount failed: 2` (la
+  imagen no tiene `/dev`), y pánico esperado `exec of /sbin/launchd failed,
+  errno 2`. Siguiente: imagen raíz de iOS 16.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
