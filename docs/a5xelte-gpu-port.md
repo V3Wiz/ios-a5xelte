@@ -135,6 +135,21 @@ that a Mali fragment job can write pixels into the active DECON scanout buffer.
 The one-shot test does not provide CoreAnimation acceleration or ongoing frame
 presentation.
 
+Patch `0134-a5xelte-g3d-serialized-fence-selftest.patch` adds opt-in
+`a5gpu=6`. It submits two driver-owned, private 16×16 fragment clears with
+different colors through one job slot. The second submission follows only a
+completed first fence. Completion requires a job IRQ, an idle slot, a DONE
+job header, matching output pixels and no MMU/GPU fault. A timeout or
+ambiguous result halts further submissions and keeps GPU-visible pages pinned.
+The kernel linked successfully; the build wrapper reported only its known
+post-link `dsymutil` file-descriptor permission failure. The 0134 image was
+written to BOOT p10 without creating a new BOOT backup at the user's request,
+and the device was rebooted. Hardware fence results are still pending the
+TWRP SYSTEM log. This remains a boot-time diagnostic, not an iOS frame queue.
+
+The queue ownership, fence semantics and route from IOSurface swaps to Mali
+are specified in [a5xelte-gpu-queue.md](a5xelte-gpu-queue.md).
+
 ## What currently limits the screen
 
 `xnu/iokit/Kernel/arm/SweetFramebuffer.cpp` is the inherited AppleCLCD bridge.
