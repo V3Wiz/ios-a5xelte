@@ -103,4 +103,15 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   continuing unsealed`, `devfs_kernel_mount: kernel_mount failed: 2` (la
   imagen no tiene `/dev`), y pánico esperado `exec of /sbin/launchd failed,
   errno 2`. Siguiente: imagen raíz de iOS 16.
+- **Root de iOS 16.7.16 (iPhone X, D22AP) en USERDATA.** Workflow `ios-root`
+  en el repo privado `wardevsa/ios-herolte-root` (la imagen es software de
+  Apple; no se publica): HFSX de 20480 MiB, 3 partes gzip verificadas por
+  SHA-256. Escrita con `tools/herolte-flash-root.py` (bloques de 64 MiB con
+  readback SHA-256, ceros escritos en el teléfono; un corte del servidor adb
+  se retomó con el archivo de estado): 320/320 bloques, imagen sha256
+  `2e200c51…13ca8`, firma `HX` en el offset 1024. ADT con `/product` real de
+  D22AP (63 propiedades) y kernel `d706ccd8…e271` (incluye 0205). Boot:
+  `rd=ufsroot0 ufsroot=USERDATA ufsrw=1 rootrw=1 cs_enforcement_disable=1
+  unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1
+  wdt=-1 -wdt_no_pmu wdt_test=no_user_checkin`, verificado por readback.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).

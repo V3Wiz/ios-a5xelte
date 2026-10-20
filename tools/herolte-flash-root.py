@@ -42,7 +42,18 @@ class Chain:
 
 
 def adb(args, tool, check=True):
-    p = subprocess.run([tool, *args], capture_output=True, text=True)
+    # The Windows adb server occasionally dies mid-run; restart and retry.
+    # Every step is idempotent (push, dd at a fixed offset, readback).
+    for attempt in range(6):
+        p = subprocess.run([tool, *args], capture_output=True, text=True)
+        transient = 'daemon' in p.stderr or 'device offline' in p.stderr or \
+            'no devices' in p.stderr or 'cannot connect' in p.stderr
+        if not (p.returncode and transient):
+            break
+        print(f'adb transient error, retry {attempt + 1}: {p.stderr.strip()[:120]}', flush=True)
+        time.sleep(5)
+        subprocess.run([tool, 'start-server'], capture_output=True)
+        subprocess.run([tool, 'wait-for-recovery'], capture_output=True, timeout=120)
     if check and p.returncode:
         raise SystemExit(f'adb {" ".join(args)} failed: {p.stdout} {p.stderr}')
     return p.stdout
