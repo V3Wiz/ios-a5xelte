@@ -87,4 +87,10 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   READY. Hipótesis: S-Boot deja el dispositivo en un modo de bajo consumo;
   Linux lo reactiva con START STOP UNIT (ACTIVE) al W-LUN UFS Device
   (`0xD0`). `0204` ahora lo hace antes del primer comando (probe e init).
+- **Tercer probe UFS: lectura funcionando** (run 39489906319, kernel
+  `869c4c5f…d74a`). W-LUN `0xD0` TUR: NOT READY ASC/ASCQ 04/02
+  ("initializing command required"); `START STOP UNIT (ACTIVE) 0`; LUN 0–3
+  TEST UNIT READY 0; `READ(10) LBA1 0, signature EFI PART`; GPT de 128
+  entradas de 128 bytes en LBA 2; particiones p1 `BOTA0` … p17 `USERDATA`
+  (~21,5 GB, bloques de 4 KiB). Primera lectura del UFS desde XNU.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
