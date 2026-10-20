@@ -3,8 +3,8 @@
 
 Derived from mkadt_a5xelte.py. Addresses come from exynos8890.dtsi and the
 phone's own BOOT DTB (see docs/herolte-bringup.md); none is device-verified
-under XNU yet. No storage, touch or GPU nodes: the A5 drivers for those
-target Exynos 7580 hardware.
+under XNU yet. Storage is the Exynos 8890 UFS (/herolte-ufs); no touch or
+GPU nodes: the A5 drivers for those target Exynos 7580 hardware.
 """
 import argparse
 import os
@@ -98,6 +98,12 @@ def build():
     ]))
     root.children = [n for n in root.children if n.prop('name') not in
                      (mkadt.cstr('sweet-fbcon'), mkadt.cstr('sweet-ufs'))]
+    # Exynos 8890 UFSHCI (exynos8890.dtsi ufs@0x155A0000): standard HCI at
+    # +0, vendor HCI +0x100, UNIPRO +0x1000, UFS protector +0x2000. Absolute
+    # address, read by bsd/dev/herolte_ufs.c (ufsprobe=1, rd=ufsroot0).
+    root.children.append(mkadt.node('herolte-ufs', [
+        ('reg', mkadt.u64(0x155A0000, 0x3000)),
+    ]))
     # pe_serial.c looks this node up by name for the kprintf console.
     root.children.append(mkadt.node('a5xelte-fbcon', [
         ('reg', mkadt.u64(FB_BASE, FB_WIDTH * FB_HEIGHT * 4)),
