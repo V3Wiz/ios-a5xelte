@@ -63,5 +63,13 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   Pánico en `SweetCPU.cpp:86`: `unsupported topology cpu=0 mpidr=0x100
   count=1` (el chequeo esperaba MPIDR 0 del A5).
 - `0203-herolte-boot-mpidr`: el MPIDR de arranque es constante de placa
-  (`A5XELTE_BOOT_MPIDR`: A5 `0x0`, herolte `0x100`). Sin probar.
+  (`A5XELTE_BOOT_MPIDR`: A5 `0x0`, herolte `0x100`).
+- **Kernel completo hasta la espera del root** (run 39481021599, kernel
+  sha256 `ffa3d8ea…432f`, misma cmdline). Foto del usuario: `A5XELTE CPU:
+  cpu=0 mpidr=0x100 came alive; SGI1 OK`, `1/1 CPUs initialized, SGI1
+  verified`, BSD init, AppleKeyStore, IOWatchdog, IOCoreSurfaceRoot, HID de
+  botones/touch, SWEET AMFI (0201) y Sandbox registrados, HFS 627.100.6,
+  self-tests de Skywalk `PASSED`, `lo0`/`gif0`/`stf0`, y finalmente
+  `Waiting on <dict>IOProviderClass IOMedia, Content Apple_HFS</dict>`.
+  Es el punto esperado: no hay driver de almacenamiento todavía.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
