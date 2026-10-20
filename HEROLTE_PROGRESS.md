@@ -53,5 +53,15 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   kernel no tiene atómicas LSE. El chequeo ahora ignora `K256`.
 - Actions publica los errores de compilación como anotaciones públicas
   (los logs requieren sesión de GitHub).
-- Pendiente: probar `xnu-boot.img` en el teléfono; nodo `/product` del ADT
-  a partir del IPSW.
+- **Primer arranque de XNU en el S7** (`xnu-boot.img`: loader + payload
+  pegado de 16.474.720 bytes; kernel sha256 `61a9dd49…ca5d`, cmdline
+  `debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress`).
+  Foto del usuario: consola de XNU en el framebuffer con VM bootstrap,
+  zone_init, firehose, scheduler, KDP serial, `iBoot version: herolte-entry`,
+  `SWEET PRNG`, `A5XELTE pthread: libpthread-514.100.2 registered`,
+  `SWEET AMFI: built-in interface registered`, platform expert iniciado.
+  Pánico en `SweetCPU.cpp:86`: `unsupported topology cpu=0 mpidr=0x100
+  count=1` (el chequeo esperaba MPIDR 0 del A5).
+- `0203-herolte-boot-mpidr`: el MPIDR de arranque es constante de placa
+  (`A5XELTE_BOOT_MPIDR`: A5 `0x0`, herolte `0x100`). Sin probar.
+- Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
