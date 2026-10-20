@@ -83,6 +83,16 @@ readback. It checks the inherited TOP clock mux and divider are no faster than
 polls. A failure leaves the private GPU job unsubmitted. Success would prove
 only an isolated `WRITE_VALUE` job; iOS graphics would still use the CPU path.
 
+The 0129 phone log recorded the expected shader/tiler/L2 present masks but
+`mux=0`, divider `0x30`. The conservative 0129 clock gate therefore stopped
+before touching BUCK4 or submitting work. Patch `0130-a5xelte-g3d-safe-top-clock.patch`
+mirrors the native Exynos7580 clock transition after BUCK4 is verified:
+temporarily slow both dividers to eight, select TOP with a bounded mux-status
+poll, select core /3 and peripheral /4, and check the final registers before
+powering cores. The transition is refused while any GPU core is already ready.
+This 0130 BOOT trial has been written to the phone; its runtime result is still
+pending.
+
 ## What currently limits the screen
 
 `xnu/iokit/Kernel/arm/SweetFramebuffer.cpp` is the inherited AppleCLCD bridge.
