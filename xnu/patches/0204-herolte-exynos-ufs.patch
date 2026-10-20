@@ -12,10 +12,10 @@ index 851addd..75545e7 100644
  bsd/dev/sweet_sample.c			standard
 diff --git a/bsd/dev/herolte_ufs.c b/bsd/dev/herolte_ufs.c
 new file mode 100644
-index 0000000..9bb8ea7
+index 0000000..4256305
 --- /dev/null
 +++ b/bsd/dev/herolte_ufs.c
-@@ -0,0 +1,756 @@
+@@ -0,0 +1,769 @@
 +/*
 + * HEROLTE (Galaxy S7, Exynos 8890) internal UFS root device.
 + *
@@ -119,6 +119,7 @@ index 0000000..9bb8ea7
 +	vm_offset_t dma;                        /* kernel VA of the DMA allocation */
 +	uint64_t dma_pa;
 +	uint8_t lun;
++	uint8_t sense_key, asc, ascq;     /* last CHECK CONDITION */
 +	uint8_t tag;
 +	uint64_t first_block, nblocks;          /* partition, in 4 KiB device blocks */
 +	uint32_t secsize;                       /* logical sector size for the BSD layer */
@@ -266,8 +267,15 @@ index 0000000..9bb8ea7
 +
 +	uint32_t ocs = utrd->dw2 & 0xff;
 +	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
-+		printf("HEROLTE UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
-+		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
++		const uint8_t *s = &ucd->resp[34];
++		unsigned slen = (unsigned)ucd->resp[32] << 8 | ucd->resp[33];
++		su.sense_key = slen >= 3 ? s[2] & 0xf : 0xff;
++		su.asc = slen >= 13 ? s[12] : 0xff;
++		su.ascq = slen >= 14 ? s[13] : 0xff;
++		printf("HEROLTE UFS: lun %u cmd 0x%02x failed: ocs 0x%x upiu 0x%x resp 0x%x status 0x%x"
++		    " sense len %u key 0x%x asc 0x%x ascq 0x%x\n",
++		    su.lun, cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7],
++		    slen, su.sense_key, su.asc, su.ascq);
 +		return EIO;
 +	}
 +	return 0;
@@ -710,9 +718,14 @@ index 0000000..9bb8ea7
 +	int error = ufs_take_over_host();
 +	if (!error) {
 +		static const uint8_t tur[6] = { 0x00 };
-+		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++		for (unsigned lun = 0; lun < 8; lun++) {
++			int e = 0;
++			su.lun = (uint8_t)lun;
++			for (int i = 0; i < 3 && (e = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++			}
++			printf("HEROLTE UFS: probe: lun %u TEST UNIT READY %d\n", lun, e);
 +		}
-+		printf("HEROLTE UFS: probe: TEST UNIT READY %d\n", error);
++		su.lun = 0;
 +	}
 +	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
 +	if (!error) {

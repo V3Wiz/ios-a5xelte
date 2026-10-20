@@ -72,4 +72,13 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   self-tests de Skywalk `PASSED`, `lo0`/`gif0`/`stf0`, y finalmente
   `Waiting on <dict>IOProviderClass IOMedia, Content Apple_HFS</dict>`.
   Es el punto esperado: no hay driver de almacenamiento todavía.
+- **Primer probe UFS** (`0204`, run 39484347438, kernel `d3905386…45f2`,
+  `ufsprobe=1`): `cap 0x383ff0f ver 0x200 hcs 0x10f hce 0x1 is 0
+  utrlba 0x0:ef002000 dbr 0 rsr 1`, `txprdt 0xc rxprdt 0xc nexus 0xffff`.
+  El host quedó vivo tras S-Boot y tomó nuestra lista. TEST UNIT READY en
+  LUN 0 (3 veces): `ocs 0x7 upiu 0x21 response 0x1 status 0x2`, o sea un
+  UPIU de respuesta real con CHECK CONDITION: el transporte (UTRD con
+  offsets en bytes, PRDT, NEXUS, doorbell) funciona. El probe no siguió a
+  READ porque abortaba tras el TUR. Siguiente: imprimir el sense, probar
+  LUN 0..7 y leer LBA1 aunque falle el TUR.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
