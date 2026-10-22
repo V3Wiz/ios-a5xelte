@@ -90,7 +90,10 @@ def build():
     ]))
     arm_io.children.append(mkadt.node('disp0', [
         ('device_type', mkadt.cstr('display-subsystem')),
-        ('compatible', mkadt.cstr('samsung,herolte-display')),
+        # AppleCLCD (SweetFramebuffer.cpp) matches 'samsung,a5xelte-display'
+        # in KernelConfigTables.cpp; without it SpringBoard sees no main display.
+        ('compatible', mkadt.cstr('samsung,a5xelte-display') +
+         mkadt.cstr('samsung,herolte-display')),
         ('canvas-width', mkadt.u32(FB_WIDTH)),
         ('canvas-height', mkadt.u32(FB_HEIGHT)),
     ]))

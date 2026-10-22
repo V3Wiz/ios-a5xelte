@@ -114,4 +114,18 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   `rd=ufsroot0 ufsroot=USERDATA ufsrw=1 rootrw=1 cs_enforcement_disable=1
   unentitled_ios_sim_launch=1 ignition_level=1 launchd_unsecure_cache=1
   wdt=-1 -wdt_no_pmu wdt_test=no_user_checkin`, verificado por readback.
+- **Primer arranque de iOS** (log persistente 0206, kernel `012d056a…af10`,
+  53 flushes): launchd hace todo el early boot (fsck, mount-phase-1/2,
+  keybag, obliteration, launchd_cache_loader con `launchd_unsecure_cache`) y
+  llega a `Early boot complete`; lanza SpringBoard, backboardd, keybagd,
+  bluetoothd, fairplayd.H2, etc. SpringBoard aborta en loop (24 veces):
+  `NSInternalInconsistencyException: We expect a valid bounds for
+  configuration ... Main-External ... CADisplay.name = Wireless ... bounds
+  {{0,0},{0,0}}` — no había display principal: el `disp0` del ADT decía
+  `samsung,herolte-display` y AppleCLCD matchea `samsung,a5xelte-display`.
+- **Con el ADT corregido** (boot `67953d9b…ea19`, mismo kernel): `SWEET FB:
+  AppleCLCD 1440x2560 stride 5760 at 0xe2a00000 ... presented as 1125x2436`,
+  backboardd configura el display (`display on`) y crea superficies
+  1440x2560 y 1125x2436; **SpringBoard ya no crashea** (solo CommCenter, sin
+  módem, y driverkitd). En ~5 min de log todavía no hay ningún `swap`.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
