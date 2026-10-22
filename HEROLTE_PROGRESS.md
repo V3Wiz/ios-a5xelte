@@ -200,4 +200,15 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   correr). `0213`: init del bus como el probe de Linux (reset, master, código
   HS `0x0f`, HS|AUTO), tres formas de lectura (ext de Linux, 7 bits, con STOP)
   y volcado de registros en cada falla.
+- **0213/0214:** ambos congelaron el teléfono (0213 tras resetear el HSI2C
+  del PMIC; 0214 al arrancar el primer programa del batcher a ~56 s).
+- **0215 (sondeo de solo lectura, arrancó bien):** PMU APM
+  `config=0x1 status=0x10000 option=0` (M3 alimentado pero retenido, sin
+  `ENABLE_APM`), mailbox `0x11240000` todo en 0, SRAM `0x11200000` con una
+  tabla de vectores Cortex-M válida (`00004000 0000009d …`): S-Boot deja el
+  firmware del APM cargado y el M3 detenido.
+- `0216`: alimentación del táctil por el APM, como Linux con la pantalla
+  encendida: liberar el M3 (`APM_CONFIG |= 1`, IRQ del mailbox a 0,
+  `APM_OPTION |= ENABLE_APM`) y pedirle por mailbox lecturas/escrituras del
+  S2MPS16 (LDO32/33). El batcher queda tras `herotouch=2`.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
