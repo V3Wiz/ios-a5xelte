@@ -167,4 +167,18 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   a los ~6 min: SpringBoard en `GSEventRunModal` (UI arrancada), backboardd
   rasterizando en 4 hilos (`CA::OGL::SW::image_sampler`). Siguiente BOOT
   (`a3bce0c3…0758`): `a5fb_keep_on=1 a5fb_noconsole=1 a5fb_perf=1`.
+- **0209 (volcado de registros de swap):** los dos primeros swaps son
+  frames negros a propósito (`0x104=0x80000007`, todos los ids de superficie
+  0, fondo `0x10c=0xff000000`); después no llega ningún swap con contenido.
+  backboardd crea sus superficies de render como `0x62336138` ('b3a8', 2
+  planos) de 1440x2560 y 1125x2436: la superficie por defecto (panel
+  1440x2560) contradice el tamaño presentado (1125x2436).
+- **🍎 iOS en pantalla (2026-10-22, boot `a2d97ebe…2239`, `sweetfb_native=1`):**
+  con el tamaño real del panel, primero el logo de Apple y después la
+  pantalla de configuración "Hola" (bonjour), con hora, batería e indicador
+  de inicio de iPhone X. Táctil y botones sin driver todavía.
+- `0210`: botones por GPIO ALIVE (`0x10580000`, del DTB del BOOT): Power
+  GPA2 pin 4; Vol+/Vol-/Home GPA0 pines 3/4/5, activos en bajo, solo lectura
+  con antirrebote (driver del A5 parametrizado). Táctil: `sec_ts` en 0x48 de
+  HSI2C `0x14E10000`, IRQ GPA1 pin 0 (pendiente).
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
