@@ -159,4 +159,12 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   `BKNoWatchdogs` + excepción de watchdog para Setup y el esqueleto
   `/private/var/containers`. `herolte-flash-root.py --diff` reescribe solo
   los bloques de 64 MiB que cambiaron.
+- **Root ajustado** (22 bloques reescritos con `--diff`, imagen
+  `6e77614c…c156`): sin migración ni CommCenter. **Primer SwapEnd de
+  backboardd** (`sel 5`, registro de 1132 bytes), seguido de inmediato por
+  `display off` (el driver hace el fundido a negro y no presenta), luego
+  `display on`; SpringBoard crea sus primeras IOSurfaces (ids 7–10). Muestreo
+  a los ~6 min: SpringBoard en `GSEventRunModal` (UI arrancada), backboardd
+  rasterizando en 4 hilos (`CA::OGL::SW::image_sampler`). Siguiente BOOT
+  (`a3bce0c3…0758`): `a5fb_keep_on=1 a5fb_noconsole=1 a5fb_perf=1`.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
