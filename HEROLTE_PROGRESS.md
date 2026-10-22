@@ -181,4 +181,14 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   GPA2 pin 4; Vol+/Vol-/Home GPA0 pines 3/4/5, activos en bajo, solo lectura
   con antirrebote (driver del A5 parametrizado). Táctil: `sec_ts` en 0x48 de
   HSI2C `0x14E10000`, IRQ GPA1 pin 0 (pendiente).
+- **Botones en el teléfono (boot `8c9c5843…dd25`, 0210):** los cuatro se
+  detectan y llegan a iOS (`SWEET HID: key 0xe9/0xea/0x40/0x30`). Power
+  bloquea/desbloquea (con `a5fb_keep_on` la imagen queda congelada y al
+  despertar vuelve "Hola"); Home y volumen no cambian nada en "Hola"
+  (identidad iPhone X: se pasa deslizando hacia arriba).
+- `0211`: driver táctil `bsd/dev/herolte_touch.c` (sec_ts en 0x48 de
+  HSI2C `0x14E10000`, pines GPF1-0/1 función 2, INT GPA1-0 por sondeo cada
+  5 ms; eventos `0x71` de 8 bytes, coordenadas 0..4095 escaladas a
+  1440x2560) y `SweetHID` con la geometría del panel del S7. No toca las
+  LDO32/33 del PMIC: si no responde, lo deja anotado.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
