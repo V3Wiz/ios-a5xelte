@@ -128,4 +128,10 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   backboardd configura el display (`display on`) y crea superficies
   1440x2560 y 1125x2436; **SpringBoard ya no crashea** (solo CommCenter, sin
   módem, y driverkitd). En ~5 min de log todavía no hay ningún `swap`.
+- **Arranque largo (~20 min) con el ADT corregido:** log hasta el flush #37
+  (46 KB). backboardd hace `SwapBegin` (sel 4) y sel 52, pero nunca
+  `SwapEnd` (sel 5): ningún `SWEET FB: swap`, ninguna registración de
+  notificaciones de vsync. El log deja de crecer bastante antes del final.
+  `0207`: sampler de hilos (`sweet_sample.c`, SpringBoard/backboardd, a los
+  90 s y cada 120 s) y latido `HEROLTE LOG: alive N s` cada 60 s.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
