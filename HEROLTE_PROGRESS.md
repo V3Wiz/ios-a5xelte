@@ -191,4 +191,13 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   5 ms; eventos `0x71` de 8 bytes, coordenadas 0..4095 escaladas a
   1440x2560) y `SweetHID` con la geometría del panel del S7. No toca las
   LDO32/33 del PMIC: si no responde, lo deja anotado.
+- **0211 en el teléfono:** GPF1 `dat=0` y GPA1 `dat=0` (SDA/SCL e INT en
+  bajo), el HSI2C táctil queda en `trans=0x2000c` con el primer byte en la
+  FIFO: el sec_ts está sin alimentación después de S-Boot.
+- **0212 en el teléfono:** el batcher del PMIC (`0x10550000`) completa el
+  envío del registro, pero la lectura queda en `bat_state=0x200` con la FIFO
+  RX vacía; no se encendió nada (la verificación de voltaje no llegó a
+  correr). `0213`: init del bus como el probe de Linux (reset, master, código
+  HS `0x0f`, HS|AUTO), tres formas de lectura (ext de Linux, 7 bits, con STOP)
+  y volcado de registros en cada falla.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
