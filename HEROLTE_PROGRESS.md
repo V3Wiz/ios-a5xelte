@@ -134,4 +134,15 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   notificaciones de vsync. El log deja de crecer bastante antes del final.
   `0207`: sampler de hilos (`sweet_sample.c`, SpringBoard/backboardd, a los
   90 s y cada 120 s) y latido `HEROLTE LOG: alive N s` cada 60 s.
+- **Muestreos 0207** (kernel con sampler, ~14 min, latido estable cada
+  60 s: el sistema no está colgado). Simbolizado contra la dyld cache de la
+  imagen: el hilo `IOMFBServer` de backboardd rasteriza con el renderer de
+  CPU de QuartzCore (`CA::OGL::SW::scanline`, `vAlpha_Blend` de vImage) y
+  reintenta `eagl_init` (busca GPU) en cada `render_for_time`; el hilo
+  principal de backboardd queda en `CA::Display::Display::update` (mach_msg)
+  y SpringBoard espera en `FBSystemShellInitialize` (check-in síncrono con
+  backboardd). Con un solo A53 el primer frame no termina.
+- `0208`: SMP en los 4 A53 (MPIDR `0x100..0x103`) por PSCI `CPU_ON`, IPIs
+  GICv2 dirigidas por la máscara de ITARGETSR0 de cada núcleo (adaptado de
+  los pendientes 0112/0113 del A5). Requiere `cpus=4`.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
