@@ -145,4 +145,18 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
 - `0208`: SMP en los 4 A53 (MPIDR `0x100..0x103`) por PSCI `CPU_ON`, IPIs
   GICv2 dirigidas por la máscara de ITARGETSR0 de cada núcleo (adaptado de
   los pendientes 0112/0113 del A5). Requiere `cpus=4`.
+- **Primer arranque con 4 núcleos** (`cpus=4`, boot `77af8df8…d298`):
+  foto `A5XELTE CPU: cpu=1..3 PSCI CPU_ON rc=0 ... came alive; SGI1 OK`,
+  `4/4 CPUs initialized, SGI1 verified`; el arranque va notablemente más
+  rápido. Log (flush #67, 11 min): el hilo principal de backboardd ya no se
+  bloquea; ahora espera en `DMPerformMigration` (XPC síncrono) mientras
+  `com.apple.migrationpluginwrapper` aborta (3 veces), y SpringBoard sigue en
+  `FBSystemShellInitialize`. CommCenter crashea 45 veces (sin módem). Sin
+  `swap` todavía.
+- `tools/herolte-tune-ios-root.sh` (en el workflow `ios-root`): como las
+  imágenes v12/v13 del donor, `LastSystemVersion` en
+  `com.apple.migration.plist`, CommCenter fuera de `launchd.plist`,
+  `BKNoWatchdogs` + excepción de watchdog para Setup y el esqueleto
+  `/private/var/containers`. `herolte-flash-root.py --diff` reescribe solo
+  los bloques de 64 MiB que cambiaron.
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).

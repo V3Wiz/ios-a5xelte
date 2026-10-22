@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Write the gzip'd iOS root image to USERDATA through TWRP's adb.
 
-  herolte-flash-root.py ADB root.img.gz.part00 [part01 ...] [--state FILE]
+  herolte-flash-root.py ADB root.img.gz.part00 [part01 ...] [--state FILE] [--diff]
 
 Windows adb truncates binary stdin to `adb shell`, and TWRP's adbd ignores
 `exec-in`, so the image travels as files: the decompressed stream is cut into
@@ -65,6 +65,8 @@ def main():
     ap.add_argument('adb')
     ap.add_argument('parts', nargs='+')
     ap.add_argument('--state', default='herolte-flash-root.state')
+    ap.add_argument('--diff', action='store_true',
+                    help='read each chunk back first and skip it if the phone already has it')
     a = ap.parse_args()
 
     if adb(['shell', "mount | grep -c ' /data ' || true"], a.adb).strip() != '0':
@@ -76,7 +78,7 @@ def main():
     state = open(a.state, 'a')
     stream = gzip.GzipFile(fileobj=Chain(a.parts))
     zero = bytes(CHUNK)
-    index = written = skipped = 0
+    index = written = skipped = same = 0
     total = hashlib.sha256()
     start = time.time()
     zero_run = None
@@ -111,6 +113,15 @@ def main():
             if zero_run is not None:
                 clear(zero_run, index)
                 zero_run = None
+            if index not in done and a.diff:
+                seek, count = offset // MIB, (len(data) + MIB - 1) // MIB
+                back = adb(['shell', f'dd if={DEV} bs=1048576 skip={seek} count={count} '
+                            f'2>/dev/null | head -c {len(data)} | sha256sum'], a.adb).split()[0]
+                if back == hashlib.sha256(data).hexdigest():
+                    state.write(f'{index}\n')
+                    state.flush()
+                    done.add(index)
+                    same += 1
             if index not in done:
                 with gzip.open(local, 'wb', compresslevel=1) as f:
                     f.write(data)
@@ -130,7 +141,8 @@ def main():
             if index % 8 == 0:
                 rate = index * CHUNK / MIB / max(time.time() - start, 1)
                 print(f'{index * CHUNK >> 20} MiB scanned, {written} chunks written, '
-                      f'{skipped} zero chunks, {rate:.0f} MiB/s', flush=True)
+                      f'{same} already on the phone, {skipped} zero chunks, {rate:.0f} MiB/s',
+                      flush=True)
     if zero_run is not None:
         clear(zero_run, index)
     adb(['shell', 'sync'], a.adb)
