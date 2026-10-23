@@ -1,3 +1,35 @@
+# iOS 16 on the Samsung Galaxy S7 (SM-G930F, Exynos 8890) — `herolte` branch
+
+**Status, 2026-10-22:** Apple's XNU kernel boots on a flat Galaxy S7 and runs the
+unmodified **iPhone X iOS 16.7.16 userland** up to the **"Hello" setup screen**,
+with the **touchscreen and all four buttons working**. Very slow: there is no GPU
+driver, so iOS renders everything on the CPU.
+
+| Area | State |
+| --- | --- |
+| Boot | Samsung S-Boot loads our loader from BOOT (`shim/herolte/`), which starts XNU |
+| CPU | 4 Cortex-A53 cores (PSCI); the 4 Mongoose cores are unused |
+| Storage | Own Exynos UFS driver; iOS root is HFSX in USERDATA, read/write |
+| Display | Bootloader framebuffer, 1440×2560 at native size, CPU copy at ~19 fps |
+| Touch | Samsung `sec_ts` over HSI2C, powered through the APM co-processor (S2MPS16 LDO32/33) |
+| Buttons | Power, Home, Volume ± (GPIO) |
+| Not working | GPU (Mali-T880), modem, Wi-Fi, Bluetooth, audio, camera, sensors, battery level, sleep |
+
+How to try it: [docs/herolte-howto.md](docs/herolte-howto.md) (erases USERDATA;
+Apple's software is not in this repository). Device log of every step:
+[HEROLTE_PROGRESS.md](HEROLTE_PROGRESS.md) (Spanish). The S7 kernel patches are
+`xnu/patches/0200`–`0217`; the board config is `MACHINE_CONFIG=HEROLTE`.
+
+Help is welcome, especially: smoother touch (the gesture still drops
+movement), the **Mali-T880 GPU** (the A5 port below is doing Panfrost-based
+Mali work), Wi-Fi, audio, and testing on other S7 units. Please open an issue
+with the log from `tools/herolte-log-pull.py` and a photo of the screen.
+
+Based on [orhunnx/ios-a5xelte](https://github.com/orhunnx/ios-a5xelte) (A5 2016)
+and its Redmi Note 10 Pro donor, documented below.
+
+---
+
 # ios-a5xelte (SM-A510F experimental port)
 
 This fork targets the Samsung Galaxy A5 (2016), `a5xelte` / Exynos7580. The original `ios-sweet` README remains below as a **donor reference**. Its iOS home-screen claim, Xiaomi boot commands, 16 KiB pages, UFS root, Qualcomm drivers and `userdata` flashing instructions do **not** describe the Samsung port.
