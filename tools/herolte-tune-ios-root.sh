@@ -8,6 +8,7 @@
 #   - CommCenter jobs removed from launchd.plist (no modem: crash loop).
 #   - SpringBoard watchdogs off; Setup (purplebuddy) exempt from the scene
 #     watchdog (it blocks in CoreTelephony without CommCenter).
+#   - Setup marked complete (donor image v14), no cloud configuration UI.
 #   - /private/var/containers skeleton (on iOS it lives on the data volume).
 set -euo pipefail
 
@@ -37,7 +38,19 @@ plist() {  # plist FILE KEY TYPE VALUE ...  (creates or updates entries)
 plist "$prefs/com.apple.migration.plist" LastSystemVersion string "$build"
 plist "$prefs/com.apple.springboard.plist" \
     BKNoWatchdogs bool YES \
-    FBLaunchWatchdogExceptions json '{"com.apple.purplebuddy":100}'
+    FBLaunchWatchdogExceptions json '{"com.apple.purplebuddy":100}' \
+    MCForceShowCloudConfigurationUI bool NO
+# Setup (purplebuddy) recognises the swipe but never finishes: it waits on
+# CoreTelephony and activation (donor image v14). Mark it complete;
+# activation itself comes from the ADT /chosen production-status 0 and
+# security-mode 1 properties (mobileactivationd's native branch).
+plist "$prefs/com.apple.purplebuddy.plist" \
+    SetupDone bool YES \
+    SetupFinishedAllSteps bool YES \
+    SetupVersion integer 11 \
+    daemonizeNeedsToRun bool NO
+plist "$prefs/com.apple.managedconfiguration.notbackedup.plist" \
+    LockdownActivationIndicatesCloudConfigurationAvailable bool NO
 
 launchd="$root/System/Library/xpc/launchd.plist"
 /usr/bin/python3 - "$launchd" <<'EOF'
