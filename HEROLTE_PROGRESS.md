@@ -211,4 +211,15 @@ pantalla y comportamiento de iOS. Plan y mapa de hardware en
   encendida: liberar el M3 (`APM_CONFIG |= 1`, IRQ del mailbox a 0,
   `APM_OPTION |= ENABLE_APM`) y pedirle por mailbox lecturas/escrituras del
   S2MPS16 (LDO32/33). El batcher queda tras `herotouch=2`.
+- **🖐 Táctil funcionando (0216, boot `626b33c7…2d1d`):** el APM responde
+  por mailbox (S2MPS16 `id=0x2`, `L32CTRL=0x2e`, `L33CTRL=0x3c`;
+  escrituras `0xee`/`0xfc` con respuesta `0xa`, readback correcto); con las
+  LDO encendidas SDA/SCL suben (`GPF1 dat=0x3`), el sec_ts está en modo app
+  (`0x20`, id `ac a5 52`, tx=15 rx=26) y los toques llegan a iOS
+  (coordenadas 0..4095 confirmadas). Muy lento y el gesto de deslizar hacia
+  arriba no se completa: lecturas I2C con `int=0x400` (NACK) justo después
+  de apoyar el dedo pierden los eventos de movimiento.
+- `0217`: reintentos de lectura como `sec_ts_i2c_read()` (hasta 10),
+  contadores `moves/i2c_retries/lost_reads`; las pausas de 11 s solo con
+  `herotouchslow=1` (el táctil queda listo a los pocos segundos).
 - Pendiente: nodo `/product` del ADT a partir del IPSW; root (UFS).
