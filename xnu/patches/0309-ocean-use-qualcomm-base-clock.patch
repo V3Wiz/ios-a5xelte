@@ -1,0 +1,52 @@
+diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
+--- a/bsd/dev/ocean_sdhci.c
++++ b/bsd/dev/ocean_sdhci.c
+@@ -225,14 +225,44 @@
+         /* Fixed 1.8V I/O min=max in live FDT; pad/rails retained. */
+         __asm__ volatile("dsb sy" ::: "memory");
+     }
+-    /* SDHCI v3 /2046 divisor: <=196kHz at source's supported <=400MHz.
+-     * Preserve GCC source/divider/PLL. Deliberately slow identification. */
+-    w16(0x2c, 0xffc1);
++    /* Motorola SDHCI_QUIRK2_ALWAYS_USE_BASE_CLOCK: divider must be 0.
++     * Its exact SDCC1 frequency table uses XO19.2MHz /12 *1/4=400kHz.
++     * Program only this controller's RCG; never alter shared PLLs. */
++    w16(0x2c, 0);
++    gcc[0x4200c / 4] = 1;
++    gcc[0x42010 / 4] = 0xfffffffcU; /* ~(N-M), N=4 M=1. */
++    gcc[0x42014 / 4] = 0xfffffffbU; /* ~N. */
++    uint32_t config = (gcc[0x42008 / 4] & ~0x371fU) | 0x2017U;
++    gcc[0x42008 / 4] = config;
++    __asm__ volatile("dsb sy" ::: "memory");
++    gcc[0x42004 / 4] |= 1; /* CMD_RCGR_CONFIG_UPDATE. */
++    __asm__ volatile("dsb sy" ::: "memory");
++    start = ticks();
++    while (gcc[0x42004 / 4] & 0x80000001U) {
++        if (ticks() - start > 1920000ULL) {
++            printf("OCEAN CLOCK: RCG update/root timeout cmd=%x\n", gcc[0x42004 / 4]);
++            return ETIMEDOUT;
++        }
++    }
++    printf("OCEAN CLOCK: XO400k cfg=%x M=%x N=%x D=%x\n",
++        gcc[0x42008 / 4], gcc[0x4200c / 4], gcc[0x42010 / 4], gcc[0x42014 / 4]);
++    if (gcc[0x42008 / 4] != config ||
++        (gcc[0x4200c / 4] & 255) != 1 ||
++        (gcc[0x42010 / 4] & 255) != 252 ||
++        (gcc[0x42014 / 4] & 255) != 251) { return EIO; }
++    w16(0x2c, 1); /* Internal clock on, divider bypass. */
+     start = ticks();
+     while (!(r16(0x2c) & 2)) {
+         if (ticks() - start > 1920000ULL) { return ETIMEDOUT; }
+     }
+-    w16(0x2c, r16(0x2c) | 4);
++    w16(0x2c, 5); /* Card on; STABLE is read-only. */
++    start = ticks();
++    while ((r16(0x2c) & 7) != 7) {
++        if (ticks() - start > 1920000ULL) {
++            printf("OCEAN CLOCK: unstable after card enable clock=%x\n", r16(0x2c));
++            return ETIMEDOUT;
++        }
++    }
+     delay_us(10000);
+     printf("OCEAN INIT: legacy clock=%x present=%x\n", r16(0x2c), r32(0x24));
+     uint32_t response;
