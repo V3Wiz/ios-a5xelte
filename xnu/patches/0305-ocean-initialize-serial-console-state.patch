@@ -1,0 +1,32 @@
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -8,6 +8,7 @@
+ #include <mach/vm_param.h>
+ #include <pexpert/protos.h>
+ #include <pexpert/pexpert.h>
++#include <arm64/sweet_early.h>
+ #include <pexpert/boot.h>
+ #include <pexpert/device_tree.h>
+ #include <pexpert/pe_images.h>
+@@ -507,8 +508,18 @@
+ PE_create_console(void)
+ {
+ #if defined(OCEAN)
+-    /* The selected serial console is the persistent BGR888 framebuffer.
+-     * Generic vc assumes 32-bit pixels; do not initialize it on this panel. */
++    /* Generic console users still need gc_initialize() and vcputc_lock.
++     * Supply no drawable video memory: initialize_screen selects serial,
++     * initializes its lock/VT state, and leaves generic drawing disabled.
++     * Preserve the real PE_state.video for future Moto display work. */
++    PE_Video serial_info = PE_state.video;
++    serial_info.v_baseAddr = 0;
++    serial_info.v_depth = 0;
++    serial_info.v_rowBytes = 0;
++    serial_info.v_length = 0;
++    serial_info.v_offset = 0;
++    PE_initialize_console(&serial_info, kPETextMode);
++    sweet_early_mark(21, "serial-only VC bookkeeping initialized");
+     return;
+ #endif
+ 	/*
