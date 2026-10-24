@@ -1,0 +1,301 @@
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1825,7 +1825,33 @@
+ #define ARM64_PHYSMAP_ALIGNMENT_PADDING (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE)
+ #endif
+ 
+-#if defined(SWEET) && !defined(A5XELTE)
++#if defined(OCEAN)
++/* Reserve three empty 2 MiB slots above low globals, below the image.
++ * The panel buffer is not block-aligned; expose the original +0x1000 offset. */
++#define OCEAN_FB_BLOCK_PA (A5XELTE_FB_PA & ~(ARM_TT_L2_SIZE - 1ULL))
++#define SWEET_EARLY_FB_VA (LOW_GLOBAL_BASE_ADDRESS + ARM_TT_L2_SIZE)
++static void
++sweet_early_map_final(void)
++{
++    const vm_map_address_t base = SWEET_EARLY_FB_VA;
++    assert(base + A5XELTE_FB_BLOCKS * ARM_TT_L2_SIZE <= gVirtBase);
++    for (unsigned int i = 0; i < A5XELTE_FB_BLOCKS; i++) {
++        vm_map_address_t va = base + i * ARM_TT_L2_SIZE;
++        tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
++        assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) ==
++            (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
++        tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
++        tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
++        assert(*slot == ARM_TTE_EMPTY);
++        *slot = (OCEAN_FB_BLOCK_PA + i * ARM_TT_L2_SIZE) |
++            ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
++            ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
++            ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) |
++            ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
++    }
++    __asm__ volatile("dsb ishst" ::: "memory");
++}
++#elif defined(SWEET) && !defined(A5XELTE)
+ /*
+  * The reserved low-globals/kernel region is excluded from VM allocation.
+  * Use the otherwise empty 32MB block above low globals and below gVirtBase
+@@ -2179,7 +2205,7 @@
+ 
+ 	arm_set_user_tbi();
+ 
+-#if defined(SWEET) && !defined(A5XELTE)
++#if defined(OCEAN) || (defined(SWEET) && !defined(A5XELTE))
+ 	/* phystokv() must still refer to the bootstrap aperture here. */
+ 	sweet_early_map_final();
+ #endif
+@@ -2188,7 +2214,10 @@
+ 
+ 	ml_enable_monitor();
+ 
+-#if defined(SWEET) && !defined(A5XELTE)
++#if defined(OCEAN)
++    /* Preserve the unaligned scanout offset within the block mapping. */
++    sweet_early_relocate(SWEET_EARLY_FB_VA + (A5XELTE_FB_PA - OCEAN_FB_BLOCK_PA));
++#elif defined(SWEET) && !defined(A5XELTE)
+ 	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
+ 	sweet_early_relocate(SWEET_EARLY_FB_VA);
+ #endif
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -15,7 +15,8 @@
+ #if defined(OCEAN)
+ /* Moto firmware scanout is packed BGR888, with a physical bootstrap alias. */
+ typedef uint8_t a5_pixel_unit;
+-#define A5_FB ((volatile a5_pixel_unit *)(uintptr_t)A5XELTE_FB_PA)
++static volatile a5_pixel_unit *ocean_fb = (volatile a5_pixel_unit *)(uintptr_t)A5XELTE_FB_PA;
++#define A5_FB ocean_fb
+ #define A5_STRIDE A5XELTE_FB_STRIDE
+ #define A5_PIXEL_UNITS 3u
+ #else
+@@ -103,7 +104,7 @@
+ void
+ sweet_early_mark(unsigned int stage, const char *label)
+ {
+-	if (!a5_active || stage > 7) {
++	if (!a5_active || stage > 99) {
+ 		return;
+ 	}
+ 	#if defined(OCEAN)
+@@ -111,7 +112,10 @@
+ #else
+     a5_string("A5 XNU STAGE ");
+ #endif
+-	sweet_early_putc((char)('0' + stage));
++    if (stage >= 10) {
++        sweet_early_putc((char)('0' + stage / 10));
++    }
++    sweet_early_putc((char)('0' + stage % 10));
+ 	a5_string(": ");
+ 	a5_string(label);
+ 	sweet_early_putc('\n');
+@@ -144,8 +148,23 @@
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
+-void sweet_early_relocate(uint64_t base) { (void)base; }
+-void sweet_early_disable(void) { a5_active = 0; }
++void sweet_early_relocate(uint64_t base)
++{
++#if defined(OCEAN)
++    ocean_fb = (volatile a5_pixel_unit *)(uintptr_t)base;
++    __asm__ volatile("dsb sy" ::: "memory");
++    sweet_early_mark(9, "final framebuffer alias live");
++#else
++    (void)base;
++#endif
++}
++void sweet_early_disable(void)
++{
++#if !defined(OCEAN)
++    a5_active = 0;
++#endif
++    /* OCEAN serial output uses this same console after VM handoff. */
++}
+ #elif defined(SWEET)
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -558,15 +558,6 @@
+ 	__builtin_arm_wsr("pan", 1);
+ #endif  /* __ARM_PAN_AVAILABLE__ */
+ 
+-#if defined(OCEAN)
+-    /* This batch covers the full pre-VM path in one run. The next mapping
+-     * transition requires a persistent 24-bit console and exception path;
+-     * do not enter inherited final-VM/device code until those are ported. */
+-    sweet_early_mark(7, "PRE-VM BATCH COMPLETE");
+-    for (;;) {
+-        __asm__ volatile("wfe" ::: "memory");
+-    }
+-#endif
+ 	sweet_early_mark(7, "entering arm_vm_init");
+ 	arm_vm_init(xmaxmem, args);
+ 	sweet_early_mark(15, "arm_vm_init returned");
+@@ -643,6 +634,9 @@
+ 
+ 	cpu_machine_idle_init(TRUE);
+ 
++#if defined(OCEAN)
++    sweet_early_mark(21, "console ready; interrupt platform init");
++#endif
+ 	PE_init_platform(TRUE, &BootCpuData);
+ 
+ #if __arm64__
+@@ -668,6 +662,9 @@
+ 
+ 	PE_init_cpu();
+ 	fiq_context_init(TRUE);
++#if defined(OCEAN)
++    sweet_early_mark(22, "GICv2 and virtual timer configured");
++#endif
+ 
+ 
+ #if HIBERNATION
+@@ -709,6 +706,9 @@
+ 	 * against string vulnerabilities
+ 	 */
+ 	__stack_chk_guard &= ~(0xFFULL << 8);
++#if defined(OCEAN)
++    sweet_early_mark(23, "entering machine_startup; no test stop");
++#endif
+ 	machine_startup(args);
+ }
+ 
+diff --git a/pexpert/arm/pe_serial.c b/pexpert/arm/pe_serial.c
+--- a/pexpert/arm/pe_serial.c
++++ b/pexpert/arm/pe_serial.c
+@@ -744,6 +744,9 @@
+ static void
+ fbcon_init(void)
+ {
++#if defined(OCEAN)
++    return;
++#endif
+ 	fbcon_cols = fbcon_width / (8 * FBCON_SCALE);
+ 	fbcon_rows = fbcon_height / (16 * FBCON_SCALE);
+ 	fbcon_col = fbcon_row = 0;
+@@ -761,6 +764,10 @@
+ static void
+ fbcon_transmit_data(uint8_t c)
+ {
++#if defined(OCEAN)
++    sweet_early_putc((char)c);
++    return;
++#endif
+ 	if (c == '\r') {
+ 		fbcon_col = 0;
+ 		return;
+@@ -813,6 +820,10 @@
+ static void
+ fbcon_probe(void)
+ {
++#if defined(OCEAN)
++    register_serial_functions(&sweet_fbcon_serial_functions);
++    return;
++#endif
+ 	DTEntry entry;
+ 	uint64_t const *reg;
+ 	uint32_t const *val;
+diff --git a/pexpert/arm/pe_init.c b/pexpert/arm/pe_init.c
+--- a/pexpert/arm/pe_init.c
++++ b/pexpert/arm/pe_init.c
+@@ -506,6 +506,11 @@
+ void
+ PE_create_console(void)
+ {
++#if defined(OCEAN)
++    /* The selected serial console is the persistent BGR888 framebuffer.
++     * Generic vc assumes 32-bit pixels; do not initialize it on this panel. */
++    return;
++#endif
+ 	/*
+ 	 * Check the head of VRAM for a panic log saved on last panic.
+ 	 * Do this before the VRAM is trashed.
+diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
+--- a/pexpert/pexpert/arm64/A5XELTE.h
++++ b/pexpert/pexpert/arm64/A5XELTE.h
+@@ -65,7 +65,11 @@
+ 
+ /* Exynos7580 has a GICv2 distributor and CPU interface, not GICv3. */
+ #define HAS_GIC_V3                    0
++#if defined(OCEAN)
++#define A5XELTE_VTIMER_INTID         20
++#else
+ #define A5XELTE_VTIMER_INTID         27
++#endif
+ 
+ #ifndef ASSEMBLER
+ #define PLATFORM_PANIC_LOG_DISABLED
+diff --git a/pexpert/arm/pe_fiq.c b/pexpert/arm/pe_fiq.c
+--- a/pexpert/arm/pe_fiq.c
++++ b/pexpert/arm/pe_fiq.c
+@@ -305,13 +305,24 @@
+ 	}
+ 	a5_gic_cpu_masks[logical] = mask;
+ #endif
+-	/* INTID 27 is the virtual timer PPI; SGI 1 is the local self signal. */
++#if defined(OCEAN)
++    /* Avoid inherited peripheral interrupts before their drivers exist.
++     * All registers below are in the DT-verified non-secure GICv2 window. */
++    unsigned int groups = (a5_gic_read32(a5_gicd_base, 0x004) & 31U) + 1U;
++    for (unsigned int bank = 1; bank < groups; bank++) {
++        a5_gic_write32(a5_gicd_base, 0x180 + bank * 4, 0xffffffffU);
++    }
++    a5_gic_write32(a5_gicd_base, 0x180, 0xffffffffU);
++    kprintf("OCEAN GICv2: timer INTID %u, IIDR 0x%x\n",
++        A5XELTE_VTIMER_INTID, a5_gic_read32(a5_gicd_base, 0x008));
++#endif
++    /* Architectural virtual timer PPI and local SGI 1. */
+ 	a5_gic_write32(a5_gicd_base, 0x080,
+-	    a5_gic_read32(a5_gicd_base, 0x080) | (1U << 27) | (1U << 1));
++	    a5_gic_read32(a5_gicd_base, 0x080) | (1U << A5XELTE_VTIMER_INTID) | (1U << 1));
+ 	for (unsigned int i = 0; i < 32; i += 4) {
+ 		a5_gic_write32(a5_gicd_base, 0x400 + i, 0xa0a0a0a0U);
+ 	}
+-	a5_gic_write32(a5_gicd_base, 0x100, (1U << 27) | (1U << 1));
++	a5_gic_write32(a5_gicd_base, 0x100, (1U << A5XELTE_VTIMER_INTID) | (1U << 1));
+ 	a5_gic_write32(a5_gicc_base, 0x004, 0xff); /* GICC_PMR */
+ 	a5_gic_write32(a5_gicc_base, 0x008, 0);    /* GICC_BPR */
+ 	a5_gic_write32(a5_gicc_base, 0x000,
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -38,7 +38,9 @@
+     "   {"
+     "     'IOClass'         = SweetPlatformExpert;"
+     "     'IOProviderClass' = IOPlatformExpertDevice;"
+-#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#if defined(ARM64_BOARD_CONFIG_OCEAN)
++    "     'IONameMatch'     = 'motorola,ocean';"
++#elif defined(ARM64_BOARD_CONFIG_A5XELTE)
+     "     'IONameMatch'     = 'samsung,a5xelte';"
+ #else
+     "     'IONameMatch'     = 'xiaomi,sweet';"
+@@ -48,7 +50,9 @@
+     "   {"
+     "     'IOClass'         = SweetCPU;"
+     "     'IOProviderClass' = IOPlatformDevice;"
+-#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#if defined(ARM64_BOARD_CONFIG_OCEAN)
++    "     'IONameMatch'     = 'qcom,kryo250';"
++#elif defined(ARM64_BOARD_CONFIG_A5XELTE)
+     "     'IONameMatch'     = 'arm,cortex-a53';"
+ #else
+     "     'IONameMatch'     = 'qcom,kryo470';"
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -771,7 +771,7 @@
+ 		}
+ 	}
+ 
+-#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && !defined(ARM64_BOARD_CONFIG_OCEAN)
+ 	/* GPIO keys: Exynos 7580 or, on HEROLTE, the Exynos 8890 ALIVE pins. */
+ 	a5xelte_keys_init();
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE)
