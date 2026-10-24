@@ -1,0 +1,32 @@
+diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
+--- a/bsd/dev/ocean_sdhci.c
++++ b/bsd/dev/ocean_sdhci.c
+@@ -138,9 +138,26 @@
+     if (!ocean_regs) { return ENXIO; }
+     printf("OCEAN SDHCI: version=0x%x state=0x%x clock=0x%x power=0x%x host=0x%x ctl2=0x%x\n",
+         r16(0xfe), r32(0x24), r16(0x2c), r8(0x29), r8(0x28), r16(0x3e));
+-    if (!(r16(0x2c) & 4) || !(r8(0x29) & 1) || r16(0xfe) == 0xffff) {
+-        printf("OCEAN SDHCI: firmware did not leave a live host; no clock/voltage guessing\n");
++    uint16_t clock = r16(0x2c);
++    if ((clock & 3) != 3 || !(r8(0x29) & 1) || r16(0xfe) == 0xffff) {
++        printf("OCEAN SDHCI: firmware internal clock/power unavailable; no retuning\n");
+         return ENXIO;
++    }
++    if (!(clock & 4)) {
++        /* Hardware report: INT_EN + INT_STABLE, card clock gated (0x3).
++         * Change ONLY CARD_EN. Preserve divisor, generator, speed, power,
++         * bus width, DLL tuning and host-control state from firmware. */
++        w16(0x2c, clock | 4);
++        __asm__ volatile("dsb sy; isb" ::: "memory");
++        uint64_t start = ticks();
++        while (ticks() - start < 19200000ULL / 1000) {
++            __asm__ volatile("yield");
++        }
++        uint16_t enabled = r16(0x2c);
++        printf("OCEAN SDHCI: card clock 0x%x -> 0x%x\n", clock, enabled);
++        if ((enabled & 7) != 7 || (enabled & ~4U) != (clock & ~4U)) {
++            return EIO;
++        }
+     }
+     w32(0x38, 0); /* Poll only; no peripheral interrupt handler installed. */
+     w32(0x34, 0xffff8033U);
