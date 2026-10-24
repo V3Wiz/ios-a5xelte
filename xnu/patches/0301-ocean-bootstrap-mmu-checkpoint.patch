@@ -1,0 +1,82 @@
+diff --git a/osfmk/arm64/start.s b/osfmk/arm64/start.s
+--- a/osfmk/arm64/start.s
++++ b/osfmk/arm64/start.s
+@@ -517,18 +517,16 @@
+ 	mov		x21, #0
+ 
+ #if defined(OCEAN)
+-    /* First real XNU instruction-path trial. Halt BEFORE the generic
+-     * A5XELTE bootstrap or ANY inherited Samsung MMIO path can execute.
++    /* Second XNU trial: continue through generic bootstrap page tables,
++     * stop immediately after MMU enable, before Samsung MMIO paths.
+      * ARM64 start.s enters with translation off; relative iso_font accesses
+      * resolve within the loaded kernel. No stack or external calls. */
+     adr x0, Locean_entry_message
+     bl Locean_entry_text
+-Locean_entry_stop:
+-    wfe
+-    b Locean_entry_stop
+-#endif
+-
+-#if defined(A5XELTE)
++    /* Continue only through the generic 4 KB bootstrap assembly. */
++#endif
++
++#if defined(A5XELTE) && !defined(OCEAN)
+ 	/* Earliest XNU-owned physical marker in preserved Samsung log RAM. */
+ 	MOV64	x10, A5XELTE_MARKER_PA
+ 	MOV64	x11, 0x3145544c45554e58
+@@ -726,7 +724,11 @@
+ 	/* A5XELTE_FB_BLOCKS 2 MiB blocks map the scanout buffer VA=PA.
+ 	 * Its L1 index differs from isolated XNU RAM, so this uses one extra
+ 	 * bootstrap L2 page. Mark it write-combined for DECON DMA visibility. */
++#if defined(OCEAN)
++    MOV64 x0, (A5XELTE_FB_PA & ~0x1fffff)
++#else
+ 	MOV64	x0, A5XELTE_FB_PA
++#endif
+ 	mov		x4, x0
+ 	mov		x5, #A5XELTE_FB_BLOCKS
+ 	create_bootstrap_mapping x0, x4, x5, x1, x2, x6, x10, x11, x12, x13
+@@ -902,6 +904,17 @@
+ 	MOV64   x0, SCTLR_EL1_DEFAULT
+ 	MSR_SCTLR_EL1_X0
+ 	isb		sy
++
++#if defined(OCEAN)
++    /* Reached only after the actual XNU SCTLR enable + ISB. The identity
++     * mapping preserves this physical code and the framebuffer alias.
++     * No C runtime, timer interrupt, platform driver, or filesystem starts. */
++    adr x0, Locean_mmu_message
++    bl Locean_mmu_text
++Locean_mmu_stop:
++    wfe
++    b Locean_mmu_stop
++#endif
+ 
+ #if defined(A5XELTE)
+ 	/* Blue block: the 4 KiB MMU is active and the framebuffer alias works. */
+@@ -1169,6 +1182,12 @@
+     add x3, x3, EXT(iso_font)@pageoff
+     MOV64 x4, (0x90001000 + 240*2160 + 24*3)
+     mov x5, #2160
++    b Locean_char
++Locean_mmu_text:
++    adrp x3, EXT(iso_font)@page
++    add x3, x3, EXT(iso_font)@pageoff
++    MOV64 x4, (0x90001000 + 300*2160 + 24*3)
++    mov x5, #2160
+ Locean_char:
+     ldrb w6, [x0], #1
+     cbz w6, Locean_done
+@@ -1213,7 +1232,9 @@
+     dsb sy
+     ret
+ Locean_entry_message:
+-    .asciz "OCEAN XNU ENTRY REACHED - TEST STOP"
++    .asciz "OCEAN XNU ENTRY - CONTINUING"
++Locean_mmu_message:
++    .asciz "OCEAN XNU 4K MMU ON - TEST STOP"
+     .align 2
+ #endif
+ 
