@@ -98,6 +98,9 @@ jobs:
           set -o pipefail
           bash build.sh 2>&1 | tee ../build.log
 
+      - name: Check production eMMC init with injected register faults
+        run: python3 tools/test-ocean-init-model.py
+
       # Logs need a GitHub sign-in to read; check-run annotations are public.
       # Publish the first errors and the log tail so failures can be read
       # through the API (repos/.../check-runs/<job>/annotations).

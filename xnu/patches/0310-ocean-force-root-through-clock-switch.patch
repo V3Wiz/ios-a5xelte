@@ -1,0 +1,31 @@
+diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
+--- a/bsd/dev/ocean_sdhci.c
++++ b/bsd/dev/ocean_sdhci.c
+@@ -197,6 +197,8 @@
+     while (r8(0x2f) & 1) {
+         if (ticks() - start > 1920000ULL) { return ETIMEDOUT; }
+     }
++    core[0x78 / 4] |= 0x2000; /* Reapply FF clock reset protection after RESET_ALL. */
++    __asm__ volatile("dsb sy" ::: "memory");
+     w32(0x38, 0);
+     w32(0x34, 0xffff8033U);
+     w32(0x10c, 0xa1c | pad); /* Vendor POR, retain verified I/O pad voltage. */
+@@ -229,6 +231,18 @@
+      * Its exact SDCC1 frequency table uses XO19.2MHz /12 *1/4=400kHz.
+      * Program only this controller's RCG; never alter shared PLLs. */
+     w16(0x2c, 0);
++    /* Force the dedicated RCG on across the dynamic source switch,
++     * following clock-local2 rcg_set_force_enable/rcg_on_check. Keep on
++     * for this polling-only driver; ordinary runtime gating is not ported. */
++    gcc[0x42004 / 4] |= 2;
++    __asm__ volatile("dsb sy" ::: "memory");
++    start = ticks();
++    while (gcc[0x42004 / 4] & 0x80000000U) {
++        if (ticks() - start > 1920000ULL) {
++            printf("OCEAN CLOCK: force-root timeout cmd=%x\n", gcc[0x42004 / 4]);
++            return ETIMEDOUT;
++        }
++    }
+     gcc[0x4200c / 4] = 1;
+     gcc[0x42010 / 4] = 0xfffffffcU; /* ~(N-M), N=4 M=1. */
+     gcc[0x42014 / 4] = 0xfffffffbU; /* ~N. */
