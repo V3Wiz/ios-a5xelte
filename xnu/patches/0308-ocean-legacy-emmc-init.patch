@@ -12,7 +12,7 @@ diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
   */
  #if defined(ARM64_BOARD_CONFIG_OCEAN)
  #include <sys/param.h>
-@@ -118,6 +118,141 @@
+@@ -118,6 +118,148 @@
      }
      return crc;
  }
@@ -72,6 +72,7 @@ diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
 +    volatile uint32_t *gcc = (volatile uint32_t *)ml_io_map(0x01800000, 0x80000);
 +    if (!core || !gcc) { return ENXIO; }
 +    uint8_t power = r8(0x29);
++    uint32_t pad = r32(0x10c) & 0x18000U;
 +    uint32_t apps = gcc[0x42018 / 4], ahb = gcc[0x4201c / 4];
 +    if (gcc[0x42008 / 4] != 0x205) {
 +        printf("OCEAN INIT: unrecognized firmware clock source\n");
@@ -96,24 +97,30 @@ diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
 +    }
 +    w32(0x38, 0);
 +    w32(0x34, 0xffff8033U);
-+    w32(0x10c, 0xa1c); /* Motorola legacy vendor POR value. */
++    w32(0x10c, 0xa1c | pad); /* Vendor POR, retain verified I/O pad voltage. */
 +    w32(0x1b0, r32(0x1b0) & ~(1U << 10)); /* SDHCI FIFO, not alternate. */
 +    w32(0x100, r32(0x100) | (1U << 30) | (1U << 29)); /* DLL bypass. */
 +    w8(0x28, 0); /* One-bit, legacy, no DMA. CMD0 resets card bus width. */
 +    w16(0x3e, 0); /* Legacy feedback clock; no UHS/HS200/HS400 tuning. */
 +    w8(0x2e, 0x0e);
 +    /* Restore the SAME powered rail request; never choose another voltage.
-+     * Acknowledge only BUS_ON. Any unexpected off/voltage request aborts. */
++     * ACK reset notifications, then BUS_ON/fixed-voltage I/O only.
++     * A new BUS_OFF request aborts; the regulator state stays unchanged. */
++    uint32_t stale = core[0xdc / 4] & 15U;
++    core[0xe4 / 4] = stale;
++    core[0xe8 / 4] = ((stale & 3) ? 1 : 0) | ((stale & 12) ? 4 : 0);
++    __asm__ volatile("dsb sy" ::: "memory");
 +    w8(0x29, power);
 +    __asm__ volatile("dsb sy" ::: "memory");
 +    delay_us(1000);
 +    uint8_t status = (uint8_t)core[0xdc / 4];
 +    printf("OCEAN INIT: power=%x power-status=%x HC_MODE=%x\n",
 +        r8(0x29), status, core[0x78 / 4]);
-+    if ((status & ~2U) || r8(0x29) != power) { return EIO; }
-+    if (status & 2) {
-+        core[0xe4 / 4] = 2; /* W1C BUS_ON request. */
-+        core[0xe8 / 4] = 1; /* BUS_SUCCESS: firmware rails retained. */
++    if ((status & ~14U) || r8(0x29) != power) { return EIO; }
++    if (status) {
++        core[0xe4 / 4] = status; /* W1C power requests. */
++        core[0xe8 / 4] = ((status & 2) ? 1 : 0) | ((status & 12) ? 4 : 0);
++        /* Fixed 1.8V I/O min=max in live FDT; pad/rails retained. */
 +        __asm__ volatile("dsb sy" ::: "memory");
 +    }
 +    /* SDHCI v3 /2046 divisor: <=196kHz at source's supported <=400MHz.
@@ -154,7 +161,7 @@ diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
  static int map_host(void) {
      DTEntry entry;
      const void *value;
-@@ -138,30 +273,7 @@
+@@ -138,30 +280,7 @@
      if (!ocean_regs) { return ENXIO; }
      printf("OCEAN SDHCI: version=0x%x state=0x%x clock=0x%x power=0x%x host=0x%x ctl2=0x%x\n",
          r16(0xfe), r32(0x24), r16(0x2c), r8(0x29), r8(0x28), r16(0x3e));
