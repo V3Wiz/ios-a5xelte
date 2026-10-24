@@ -1,0 +1,321 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -106,6 +106,7 @@
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/a5xelte_emmc.c			standard
++bsd/dev/ocean_sdhci.c			standard
+ bsd/dev/herolte_ufs.c			standard
+ bsd/dev/herolte_touch.c			standard
+ bsd/dev/a5xelte_keys.c			standard
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -656,6 +656,10 @@
+ 	return true;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_OCEAN)
++extern "C" int ocean_sdhci_rootdev(dev_t *dev);
++#endif
++
+ kern_return_t
+ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+     dev_t * root, u_int32_t * oflags )
+@@ -770,6 +774,20 @@
+ 			regEntry->release();                                                            /* Toss the entry */
+ 		}
+ 	}
++
++#if defined(ARM64_BOARD_CONFIG_OCEAN)
++    if (strcmp(rdBootVar, "oceanroot0") == 0) {
++        OSSafeReleaseNULL(matching);
++        IOLog("OCEAN: probing SDHCI read-only root path\n");
++        int error = ocean_sdhci_rootdev(root);
++        if (error) {
++            panic("OCEAN SDHCI root unavailable (%d); see read-only probe log", error);
++        }
++        strlcpy(rootName, rdBootVar, rootNameSize);
++        *oflags = 0;
++        goto iofrootx;
++    }
++#endif
+ 
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE) && !defined(ARM64_BOARD_CONFIG_OCEAN)
+ 	/* GPIO keys: Exynos 7580 or, on HEROLTE, the Exynos 8890 ALIVE pins. */
+diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/ocean_sdhci.c
+@@ -0,0 +1,270 @@
++/* OCEAN SDHCI PIO read-only bring-up. No flash/erase/write commands.
++ * Register layout checked against the Linux SDHCI interface; physical
++ * aperture and card geometry checked against this Moto's recovery/FDT.
++ * Firmware must leave the card selected, powered, clocked and tuned.
++ * This driver deliberately does not guess clock, voltage or DLL settings.
++ */
++#if defined(ARM64_BOARD_CONFIG_OCEAN)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/locks.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include <libkern/libkern.h>
++#include <mach/mach_time.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++int ocean_sdhci_rootdev(dev_t *);
++static vm_offset_t ocean_regs;
++static uint64_t ocean_sectors, ocean_first, ocean_length;
++static bool ocean_ready;
++static dev_t ocean_dev;
++static uint32_t ocean_blocksize = 512;
++static LCK_GRP_DECLARE(ocean_sd_grp, "ocean_sdhci");
++static LCK_MTX_DECLARE(ocean_sd_lock, &ocean_sd_grp);
++
++static uint8_t r8(unsigned int off) { return *(volatile uint8_t *)(ocean_regs + off); }
++static uint16_t r16(unsigned int off) { return *(volatile uint16_t *)(ocean_regs + off); }
++static uint32_t r32(unsigned int off) { return *(volatile uint32_t *)(ocean_regs + off); }
++static void w16(unsigned int off, uint16_t v) { *(volatile uint16_t *)(ocean_regs + off) = v; }
++static void w32(unsigned int off, uint32_t v) { *(volatile uint32_t *)(ocean_regs + off) = v; }
++static uint64_t ticks(void) {
++    uint64_t n;
++    __asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(n));
++    return n;
++}
++static int wait_status(uint32_t mask) {
++    uint64_t start = ticks();
++    do {
++        uint32_t v = r32(0x30);
++        if (v & 0xffff8000U) {
++            printf("OCEAN SDHCI: error status=0x%08x present=0x%08x\n", v, r32(0x24));
++            return EIO;
++        }
++        if (v & mask) { return 0; }
++        __asm__ volatile("yield");
++    } while (ticks() - start < 19200000ULL * 2);
++    printf("OCEAN SDHCI: timeout waiting 0x%x, status=0x%x present=0x%x\n",
++        mask, r32(0x30), r32(0x24));
++    return ETIMEDOUT;
++}
++
++static int command(unsigned int cmd, uint32_t arg, uint8_t *data) {
++    /* Explicit whitelist: SEND_STATUS, READ_SINGLE_BLOCK. No CMD24/25,
++     * SWITCH, erase or partition-selection command can be issued. */
++    if (!((cmd == 13 && data == NULL) || (cmd == 17 && data != NULL))) {
++        return EINVAL;
++    }
++    uint64_t start = ticks();
++    while (r32(0x24) & 3U) {
++        if (ticks() - start >= 19200000ULL * 2) { return EBUSY; }
++        __asm__ volatile("yield");
++    }
++    w32(0x30, 0xffffffffU); /* W1C interrupt status. */
++    if (data) {
++        w16(0x04, 512);
++        w16(0x06, 1);
++        w16(0x0c, 0x12); /* READ + block count; DMA and auto commands OFF. */
++    } else {
++        w16(0x0c, 0);
++    }
++    w32(0x08, arg);
++    __asm__ volatile("dsb sy" ::: "memory");
++    w16(0x0e, (uint16_t)((cmd << 8) | 0x1aU | (data ? 0x20U : 0)));
++    int error = wait_status(1);
++    if (error) { return error; }
++    uint32_t response = r32(0x10);
++    w32(0x30, 1);
++    if (response & 0xfff80000U) {
++        printf("OCEAN SDHCI: CMD%u R1 error=0x%x\n", cmd, response);
++        return EIO;
++    }
++    if (!data) {
++        printf("OCEAN SDHCI: CMD13 R1=0x%x state=%u ready=%u\n",
++            response, (response >> 9) & 15, (response >> 8) & 1);
++        return ((response >> 9) & 15) == 4 && (response & 0x100) ? 0 : EBUSY;
++    }
++    error = wait_status(0x20);
++    if (error) { return error; }
++    for (unsigned int i = 0; i < 128; i++) {
++        uint32_t word = r32(0x20);
++        memcpy(data + i * 4, &word, 4);
++    }
++    w32(0x30, 0x20);
++    error = wait_status(2);
++    w32(0x30, 2);
++    return error;
++}
++
++static int read_sector(uint64_t lba, uint8_t *data) {
++    if (lba >= ocean_sectors || lba > UINT32_MAX) { return EINVAL; }
++    return command(17, (uint32_t)lba, data);
++}
++static uint32_t le32(const void *p) { uint32_t v; memcpy(&v,p,4); return v; }
++static uint64_t le64(const void *p) { uint64_t v; memcpy(&v,p,8); return v; }
++static uint32_t crc_step(uint32_t crc, const uint8_t *data, unsigned int n) {
++    while (n--) {
++        crc ^= *data++;
++        for (unsigned int bit = 0; bit < 8; bit++) {
++            crc = (crc >> 1) ^ ((crc & 1) ? 0xedb88320U : 0);
++        }
++    }
++    return crc;
++}
++static int map_host(void) {
++    DTEntry entry;
++    const void *value;
++    unsigned int size;
++    if (SecureDTLookupEntry(NULL, "/ocean-sdhci", &entry) != kSuccess ||
++        SecureDTGetProperty(entry, "reg", &value, &size) != kSuccess || size != 16) {
++        return ENXIO;
++    }
++    uint64_t pa = le64(value), len = le64((const uint8_t *)value + 8);
++    if (pa != 0x07824900 || len != 0x500) { return EINVAL; }
++    if (SecureDTGetProperty(entry, "sector-count", &value, &size) != kSuccess || size != 8) {
++        return EINVAL;
++    }
++    ocean_sectors = le64(value);
++    if (ocean_sectors != 122142720) { return EINVAL; }
++    printf("OCEAN SDHCI: mapping verified host, read-only PIO\n");
++    ocean_regs = ml_io_map(pa, len);
++    if (!ocean_regs) { return ENXIO; }
++    printf("OCEAN SDHCI: version=0x%x state=0x%x clock=0x%x power=0x%x host=0x%x ctl2=0x%x\n",
++        r16(0xfe), r32(0x24), r16(0x2c), r8(0x29), r8(0x28), r16(0x3e));
++    if (!(r16(0x2c) & 4) || !(r8(0x29) & 1) || r16(0xfe) == 0xffff) {
++        printf("OCEAN SDHCI: firmware did not leave a live host; no clock/voltage guessing\n");
++        return ENXIO;
++    }
++    w32(0x38, 0); /* Poll only; no peripheral interrupt handler installed. */
++    w32(0x34, 0xffff8033U);
++    return command(13, 1U << 16, NULL); /* RCA 1 confirmed in recovery. */
++}
++
++static int find_hfs(void) {
++    uint8_t header[512], sector[512];
++    int error = read_sector(0, sector);
++    if (error) { return error; }
++    uint32_t mbr_crc = ~crc_step(0xffffffffU, sector, 512);
++    printf("OCEAN SDHCI: MBR CRC32=0x%08x (recovery reference 0xa22ab8ba)\n", mbr_crc);
++    if (mbr_crc != 0xa22ab8baU || sector[510] != 0x55 || sector[511] != 0xaa) {
++        return EIO;
++    }
++    error = read_sector(1, header);
++    if (error) { return error; }
++    if (memcmp(header,"EFI PART",8) || le64(header+24) != 1) { return EINVAL; }
++    unsigned int hsize = le32(header+12);
++    uint32_t hcrc = le32(header+16);
++    if (hsize < 92 || hsize > 512) { return EINVAL; }
++    memset(header+16,0,4);
++    if (~crc_step(0xffffffffU,header,hsize) != hcrc) { return EIO; }
++    uint64_t table = le64(header+72);
++    unsigned int count = le32(header+80), entsize = le32(header+84);
++    uint32_t expected = le32(header+88), crc = 0xffffffffU;
++    if (!count || count > 256 || entsize != 128 || table < 2 ||
++        table >= ocean_sectors || (count + 3) / 4 > ocean_sectors-table) { return EINVAL; }
++    for (unsigned int i = 0; i < (count + 3)/4; i++) {
++        error = read_sector(table+i,sector);
++        if (error) { return error; }
++        crc = crc_step(crc,sector,MIN(512U,(count-i*4)*128));
++    }
++    printf("OCEAN SDHCI: GPT header CRC=0x%08x table CRC=0x%08x entries=%u\n",hcrc,~crc,count);
++    if (~crc != expected || hcrc != 0x64dfe706U || expected != 0x0c4426e0U) { return EIO; }
++    printf("OCEAN SDHCI: sector reads match recovery GPT; checking for HFS\n");
++    for (unsigned int i = 0; i < count; i++) {
++        if ((i & 3) == 0) {
++            error = read_sector(table+i/4,sector);
++            if (error) { return error; }
++        }
++        const uint8_t *e = sector + (i & 3)*128;
++        if (!le64(e) && !le64(e+8)) { continue; }
++        uint64_t first = le64(e+32), last = le64(e+40);
++        if (!first || last < first || last >= ocean_sectors || last-first < 2) { return EINVAL; }
++        char name[37];
++        for (unsigned int j = 0; j < 36; j++) { name[j] = e[56+j*2] ? (char)e[56+j*2] : 0; }
++        name[36] = 0;
++        /* Only inspect a deliberately named iOS volume, never Android data. */
++        if (strcmp(name,"IOS") && strcmp(name,"ios") && strcmp(name,"OCEAN_IOS")) { continue; }
++        uint8_t volume[512];
++        error = read_sector(first+2,volume);
++        if (error) { return error; }
++        if (volume[0] != 'H' || (volume[1] != '+' && volume[1] != 'X')) { continue; }
++        ocean_first = first; ocean_length = last-first+1;
++        printf("OCEAN SDHCI: HFS volume %s found, read-only\n",name);
++        return 0;
++    }
++    printf("OCEAN SDHCI: no iOS HFS volume installed; Android partitions untouched\n");
++    return ENOENT;
++}
++
++static int sd_open(__unused dev_t d,int flags,__unused int type,__unused struct proc *p) {
++    return !ocean_ready ? ENXIO : (flags & FWRITE) ? EROFS : 0;
++}
++static int sd_close(__unused dev_t d,__unused int flags,__unused int type,__unused struct proc *p) { return 0; }
++static void sd_strategy(buf_t bp) {
++    uint32_t count=buf_count(bp); caddr_t address=NULL; int error=0;
++    uint64_t offset=0, length=ocean_length*512;
++    buf_setresid(bp,count);
++    if (!ocean_ready) { error=ENXIO; }
++    else if (!(buf_flags(bp)&B_READ)) { error=EROFS; }
++    else if (buf_blkno(bp)<0 || (uint64_t)buf_blkno(bp)>UINT64_MAX/ocean_blocksize) { error=EINVAL; }
++    else { offset=(uint64_t)buf_blkno(bp)*ocean_blocksize;
++        if (offset>length || count>length-offset) { error=EINVAL; } }
++    if (error || !count) { goto done; }
++    if (buf_map(bp,&address)) { error=EIO; goto done; }
++    lck_mtx_lock(&ocean_sd_lock);
++    for (uint32_t n=0;n<count;) {
++        uint8_t sector[512]; uint64_t pos=offset+n;
++        uint32_t skip=pos&511, take=MIN(count-n,512-skip);
++        error=read_sector(ocean_first+pos/512,sector);
++        if (error) { break; }
++        memcpy(address+n,sector+skip,take); n+=take; buf_setresid(bp,count-n);
++    }
++    lck_mtx_unlock(&ocean_sd_lock); buf_unmap(bp);
++done:
++    if (error) { buf_seterror(bp,error); } buf_biodone(bp);
++}
++static int sd_ioctl(__unused dev_t d,u_long cmd,caddr_t data,__unused int flag,__unused struct proc *p) {
++    switch(cmd) {
++    case DKIOCGETBLOCKSIZE: *(uint32_t *)data=ocean_blocksize; return 0;
++    case DKIOCSETBLOCKSIZE: {
++        uint32_t v=*(uint32_t *)data;
++        if (v<512 || v>4096 || (v&(v-1))) { return EINVAL; }
++        ocean_blocksize=v; return 0; }
++    case DKIOCGETPHYSICALBLOCKSIZE: *(uint32_t *)data=512; return 0;
++    case DKIOCGETBLOCKCOUNT: *(uint64_t *)data=ocean_length*512/ocean_blocksize; return 0;
++    case DKIOCISWRITABLE: *(uint32_t *)data=0; return 0;
++    case DKIOCGETMAXBLOCKCOUNTREAD: case DKIOCGETMAXSEGMENTCOUNTREAD:
++    case DKIOCGETMAXSEGMENTCOUNTWRITE: *(uint64_t *)data=1; return 0;
++    case DKIOCGETMAXBLOCKCOUNTWRITE: *(uint64_t *)data=0; return 0;
++    case DKIOCSYNCHRONIZE: case DKIOCSYNCHRONIZECACHE: return 0;
++    default: return ENOTTY;
++    }
++}
++static int sd_psize(__unused dev_t d) { return ocean_ready ? (int)MIN(ocean_length*512/ocean_blocksize,INT_MAX) : -1; }
++static int sd_read(dev_t d,struct uio *u,__unused int flags) { return physio(sd_strategy,NULL,d,B_READ,minphys,u,(int)ocean_blocksize); }
++static int sd_write(__unused dev_t d,__unused struct uio *u,__unused int flags) { return EROFS; }
++static const struct bdevsw sd_bdevsw={ .d_open=sd_open,.d_close=sd_close,.d_strategy=sd_strategy,
++    .d_ioctl=sd_ioctl,.d_dump=eno_dump,.d_psize=sd_psize,.d_type=D_DISK };
++static const struct cdevsw sd_cdevsw={ .d_open=sd_open,.d_close=sd_close,.d_read=sd_read,.d_write=sd_write,
++    .d_ioctl=sd_ioctl,.d_stop=eno_stop,.d_reset=eno_reset,.d_ttys=NULL,.d_select=eno_select,
++    .d_mmap=eno_mmap,.d_strategy=eno_strat,.d_reserved_1=eno_getc,.d_reserved_2=eno_putc,.d_type=D_DISK };
++int ocean_sdhci_rootdev(dev_t *dev) {
++    if (!ocean_ready) {
++        int error=map_host(); if (error) { return error; }
++        error=find_hfs(); if (error) { return error; }
++        int bmajor=bdevsw_add(-1,&sd_bdevsw); if (bmajor<0) { return ENXIO; }
++        int cmajor=cdevsw_add_with_bdev(-1,&sd_cdevsw,bmajor); if (cmajor<0) { return ENXIO; }
++        ocean_dev=makedev(bmajor,0); ocean_ready=true;
++        devfs_make_node(ocean_dev,DEVFS_BLOCK,UID_ROOT,GID_OPERATOR,0440,"oceanroot0");
++        devfs_make_node(makedev(cmajor,0),DEVFS_CHAR,UID_ROOT,GID_OPERATOR,0440,"roceanroot0");
++    }
++    *dev=ocean_dev; return 0;
++}
++#endif
