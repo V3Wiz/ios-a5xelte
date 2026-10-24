@@ -1,0 +1,188 @@
+diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
+--- a/bsd/dev/ocean_sdhci.c
++++ b/bsd/dev/ocean_sdhci.c
+@@ -1,8 +1,8 @@
+ /* OCEAN SDHCI PIO read-only bring-up. No flash/erase/write commands.
+  * Register layout checked against the Linux SDHCI interface; physical
+  * aperture and card geometry checked against this Moto's recovery/FDT.
+- * Firmware must leave the card selected, powered, clocked and tuned.
+- * This driver deliberately does not guess clock, voltage or DLL settings.
++ * Firmware must leave the existing supply powered and GCC source running.
++ * The legacy initialization path resets/reselects the card without data writes.
+  */
+ #if defined(ARM64_BOARD_CONFIG_OCEAN)
+ #include <sys/param.h>
+@@ -118,6 +118,141 @@
+     }
+     return crc;
+ }
++/* Legacy-mode eMMC initialization. Retain the known powered firmware rails;
++ * no PMIC, PLL, partition selection, SWITCH, erase or data-write operations.
++ * Motorola QPOS30.52 legacy-MCI controller offsets and DLL bypass sequence.
++ */
++static void delay_us(unsigned int us) {
++    uint64_t start = ticks();
++    while (ticks() - start < (uint64_t)us * 192 / 10) {
++        __asm__ volatile("yield");
++    }
++}
++static void w8(unsigned int off, uint8_t v) {
++    *(volatile uint8_t *)(ocean_regs + off) = v;
++}
++static int init_command(unsigned int cmd, uint32_t arg, uint32_t *response) {
++    uint16_t flags;
++    switch (cmd) {
++    case 0: flags = 0; break;             /* GO_IDLE_STATE, no response. */
++    case 1: flags = 2; break;             /* SEND_OP_COND, R3, no CRC/index. */
++    case 2: flags = 9; break;             /* ALL_SEND_CID, R2. */
++    case 3: flags = 0x1a; break;          /* SET_RELATIVE_ADDR, R1. */
++    case 7: flags = 0x1b; break;          /* SELECT_CARD, R1b. */
++    default: return EINVAL;
++    }
++    uint64_t start = ticks();
++    while (r32(0x24) & 3U) {
++        if (ticks() - start > 19200000ULL * 2) { return EBUSY; }
++    }
++    w32(0x30, 0xffffffffU);
++    w16(0x0c, 0);
++    w32(0x08, arg);
++    __asm__ volatile("dsb sy" ::: "memory");
++    w16(0x0e, (uint16_t)((cmd << 8) | flags));
++    int error = wait_status(1);
++    if (error) {
++        printf("OCEAN INIT: CMD%u failed (%d)\n", cmd, error);
++        return error;
++    }
++    *response = r32(0x10);
++    w32(0x30, 1);
++    if ((cmd == 3 || cmd == 7) && (*response & 0xfff80000U)) {
++        return EIO;
++    }
++    if (cmd == 7) {
++        error = wait_status(2);
++        w32(0x30, 2);
++    }
++    if (cmd != 1 || (*response & 0x80000000U)) {
++        printf("OCEAN INIT: CMD%u complete\n", cmd);
++    }
++    return error;
++}
++static int initialize_card(void) {
++    volatile uint32_t *core = (volatile uint32_t *)ml_io_map(0x07824000, 0x800);
++    volatile uint32_t *gcc = (volatile uint32_t *)ml_io_map(0x01800000, 0x80000);
++    if (!core || !gcc) { return ENXIO; }
++    uint8_t power = r8(0x29);
++    uint32_t apps = gcc[0x42018 / 4], ahb = gcc[0x4201c / 4];
++    if (gcc[0x42008 / 4] != 0x205) {
++        printf("OCEAN INIT: unrecognized firmware clock source\n");
++        return ENXIO;
++    }
++    /* Reject an unpowered handoff; cannot truthfully ACK regulator setup
++     * unless it was already powered at the same selection beforehand. */
++    if (power != 0x0b || !(apps & 1) || !(ahb & 1) ||
++        ((apps | ahb) & 0x80000000U)) {
++        printf("OCEAN INIT: powered 1.8V handoff/clocks required: p=%x apps=%x ahb=%x\n",
++            power, apps, ahb);
++        return ENXIO;
++    }
++    printf("OCEAN INIT: retaining firmware rails; entering legacy SDHC mode\n");
++    w16(0x2c, 0);
++    core[0x78 / 4] |= 0x2001; /* HC_MODE_EN | FF_CLK_SW_RST_DIS. */
++    __asm__ volatile("dsb sy" ::: "memory");
++    w8(0x2f, 1); /* SDHCI RESET_ALL, controller only. */
++    uint64_t start = ticks();
++    while (r8(0x2f) & 1) {
++        if (ticks() - start > 1920000ULL) { return ETIMEDOUT; }
++    }
++    w32(0x38, 0);
++    w32(0x34, 0xffff8033U);
++    w32(0x10c, 0xa1c); /* Motorola legacy vendor POR value. */
++    w32(0x1b0, r32(0x1b0) & ~(1U << 10)); /* SDHCI FIFO, not alternate. */
++    w32(0x100, r32(0x100) | (1U << 30) | (1U << 29)); /* DLL bypass. */
++    w8(0x28, 0); /* One-bit, legacy, no DMA. CMD0 resets card bus width. */
++    w16(0x3e, 0); /* Legacy feedback clock; no UHS/HS200/HS400 tuning. */
++    w8(0x2e, 0x0e);
++    /* Restore the SAME powered rail request; never choose another voltage.
++     * Acknowledge only BUS_ON. Any unexpected off/voltage request aborts. */
++    w8(0x29, power);
++    __asm__ volatile("dsb sy" ::: "memory");
++    delay_us(1000);
++    uint8_t status = (uint8_t)core[0xdc / 4];
++    printf("OCEAN INIT: power=%x power-status=%x HC_MODE=%x\n",
++        r8(0x29), status, core[0x78 / 4]);
++    if ((status & ~2U) || r8(0x29) != power) { return EIO; }
++    if (status & 2) {
++        core[0xe4 / 4] = 2; /* W1C BUS_ON request. */
++        core[0xe8 / 4] = 1; /* BUS_SUCCESS: firmware rails retained. */
++        __asm__ volatile("dsb sy" ::: "memory");
++    }
++    /* SDHCI v3 /2046 divisor: <=196kHz at source's supported <=400MHz.
++     * Preserve GCC source/divider/PLL. Deliberately slow identification. */
++    w16(0x2c, 0xffc1);
++    start = ticks();
++    while (!(r16(0x2c) & 2)) {
++        if (ticks() - start > 1920000ULL) { return ETIMEDOUT; }
++    }
++    w16(0x2c, r16(0x2c) | 4);
++    delay_us(10000);
++    printf("OCEAN INIT: legacy clock=%x present=%x\n", r16(0x2c), r32(0x24));
++    uint32_t response;
++    int error = init_command(0, 0, &response);
++    if (error) { return error; }
++    delay_us(1000);
++    start = ticks();
++    do {
++        error = init_command(1, 0x40ff8080U, &response);
++        if (error) { return error; }
++        if (response & 0x80000000U) { break; }
++        delay_us(10000);
++    } while (ticks() - start < 19200000ULL * 3);
++    if ((response & 0xc0000080U) != 0xc0000080U) {
++        printf("OCEAN INIT: card not ready/sector-addressed/1.8V OCR=%x\n", response);
++        return ENXIO;
++    }
++    error = init_command(2, 0, &response);
++    if (error) { return error; }
++    error = init_command(3, 1U << 16, &response);
++    if (error) { return error; }
++    error = init_command(7, 1U << 16, &response);
++    if (error) { return error; }
++    printf("OCEAN INIT: card selected; one-bit read-only probe next\n");
++    return command(13, 1U << 16, NULL);
++}
++
+ static int map_host(void) {
+     DTEntry entry;
+     const void *value;
+@@ -138,30 +273,7 @@
+     if (!ocean_regs) { return ENXIO; }
+     printf("OCEAN SDHCI: version=0x%x state=0x%x clock=0x%x power=0x%x host=0x%x ctl2=0x%x\n",
+         r16(0xfe), r32(0x24), r16(0x2c), r8(0x29), r8(0x28), r16(0x3e));
+-    uint16_t clock = r16(0x2c);
+-    if ((clock & 3) != 3 || !(r8(0x29) & 1) || r16(0xfe) == 0xffff) {
+-        printf("OCEAN SDHCI: firmware internal clock/power unavailable; no retuning\n");
+-        return ENXIO;
+-    }
+-    if (!(clock & 4)) {
+-        /* Hardware report: INT_EN + INT_STABLE, card clock gated (0x3).
+-         * Change ONLY CARD_EN. Preserve divisor, generator, speed, power,
+-         * bus width, DLL tuning and host-control state from firmware. */
+-        w16(0x2c, clock | 4);
+-        __asm__ volatile("dsb sy; isb" ::: "memory");
+-        uint64_t start = ticks();
+-        while (ticks() - start < 19200000ULL / 1000) {
+-            __asm__ volatile("yield");
+-        }
+-        uint16_t enabled = r16(0x2c);
+-        printf("OCEAN SDHCI: card clock 0x%x -> 0x%x\n", clock, enabled);
+-        if ((enabled & 7) != 7 || (enabled & ~4U) != (clock & ~4U)) {
+-            return EIO;
+-        }
+-    }
+-    w32(0x38, 0); /* Poll only; no peripheral interrupt handler installed. */
+-    w32(0x34, 0xffff8033U);
+-    return command(13, 1U << 16, NULL); /* RCA 1 confirmed in recovery. */
++    return initialize_card();
+ }
+ 
+ static int find_hfs(void) {
