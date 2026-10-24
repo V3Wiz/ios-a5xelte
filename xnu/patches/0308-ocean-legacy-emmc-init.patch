@@ -81,7 +81,7 @@ diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
 +     * unless it was already powered at the same selection beforehand. */
 +    if (power != 0x0b || !(apps & 1) || !(ahb & 1) ||
 +        ((apps | ahb) & 0x80000000U)) {
-+        printf("OCEAN INIT: powered 1.8V handoff/clocks required: p=%x apps=%x ahb=%x\n",
++        printf("OCEAN INIT: powered firmware handoff/clocks required: p=%x apps=%x ahb=%x\n",
 +            power, apps, ahb);
 +        return ENXIO;
 +    }
@@ -137,8 +137,8 @@ diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
 +        if (response & 0x80000000U) { break; }
 +        delay_us(10000);
 +    } while (ticks() - start < 19200000ULL * 3);
-+    if ((response & 0xc0000080U) != 0xc0000080U) {
-+        printf("OCEAN INIT: card not ready/sector-addressed/1.8V OCR=%x\n", response);
++    if ((response & 0xc0000000U) != 0xc0000000U || !(response & 0x00ff8080U)) {
++        printf("OCEAN INIT: card not ready/sector-addressed/common OCR=%x\n", response);
 +        return ENXIO;
 +    }
 +    error = init_command(2, 0, &response);
