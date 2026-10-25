@@ -1,0 +1,222 @@
+diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
+--- a/bsd/dev/ocean_sdhci.c
++++ b/bsd/dev/ocean_sdhci.c
+@@ -1,8 +1,10 @@
+-/* OCEAN SDHCI PIO read-only bring-up. No flash/erase/write commands.
++/* OCEAN SDHCI PIO bring-up. No erase, SWITCH or partition commands.
+  * Register layout checked against the Linux SDHCI interface; physical
+  * aperture and card geometry checked against this Moto's recovery/FDT.
+  * Firmware must leave the existing supply powered and GCC source running.
+  * The legacy initialization path resets/reselects the card without data writes.
++ * Single-block writes (CMD24) need boot-arg ocean_emmcwrite=1 and are fenced
++ * to the verified userdata partition holding the selected iOS volume.
+  */
+ #if defined(ARM64_BOARD_CONFIG_OCEAN)
+ #include <sys/param.h>
+@@ -24,8 +26,10 @@
+ int ocean_sdhci_rootdev(dev_t *);
+ static vm_offset_t ocean_regs;
+ static uint64_t ocean_sectors, ocean_first, ocean_length;
+-static bool ocean_ready;
++static bool ocean_ready, ocean_writable;
+ static dev_t ocean_dev;
++#define OCEAN_USERDATA_FIRST 15826944ULL
++#define OCEAN_USERDATA_LAST  122142686ULL
+ static uint32_t ocean_blocksize = 512;
+ static LCK_GRP_DECLARE(ocean_sd_grp, "ocean_sdhci");
+ static LCK_MTX_DECLARE(ocean_sd_lock, &ocean_sd_grp);
+@@ -57,9 +61,12 @@
+ }
+ 
+ static int command(unsigned int cmd, uint32_t arg, uint8_t *data) {
+-    /* Explicit whitelist: SEND_STATUS, READ_SINGLE_BLOCK. No CMD24/25,
+-     * SWITCH, erase or partition-selection command can be issued. */
+-    if (!((cmd == 13 && data == NULL) || (cmd == 17 && data != NULL))) {
++    /* Explicit whitelist: SEND_STATUS, READ_SINGLE_BLOCK and, once enabled,
++     * WRITE_BLOCK. No CMD25, SWITCH, erase or partition-selection command
++     * can be issued. */
++    bool is_write = cmd == 24;
++    if (!((cmd == 13 && data == NULL) || (cmd == 17 && data != NULL) ||
++        (is_write && data != NULL && ocean_writable))) {
+         return EINVAL;
+     }
+     uint64_t start = ticks();
+@@ -71,7 +78,8 @@
+     if (data) {
+         w16(0x04, 512);
+         w16(0x06, 1);
+-        w16(0x0c, 0x12); /* READ + block count; DMA and auto commands OFF. */
++        /* READ (or write) + block count; DMA and auto commands OFF. */
++        w16(0x0c, is_write ? 0x02 : 0x12);
+     } else {
+         w16(0x0c, 0);
+     }
+@@ -87,17 +95,30 @@
+         return EIO;
+     }
+     if (!data) {
+-        printf("OCEAN SDHCI: CMD13 R1=0x%x state=%u ready=%u\n",
+-            response, (response >> 9) & 15, (response >> 8) & 1);
++        if (!ocean_ready) {
++            printf("OCEAN SDHCI: CMD13 R1=0x%x state=%u ready=%u\n",
++                response, (response >> 9) & 15, (response >> 8) & 1);
++        }
+         return ((response >> 9) & 15) == 4 && (response & 0x100) ? 0 : EBUSY;
+     }
+-    error = wait_status(0x20);
+-    if (error) { return error; }
+-    for (unsigned int i = 0; i < 128; i++) {
+-        uint32_t word = r32(0x20);
+-        memcpy(data + i * 4, &word, 4);
+-    }
+-    w32(0x30, 0x20);
++    if (is_write) {
++        error = wait_status(0x10); /* Buffer write ready. */
++        if (error) { return error; }
++        for (unsigned int i = 0; i < 128; i++) {
++            uint32_t word;
++            memcpy(&word, data + i * 4, 4);
++            w32(0x20, word);
++        }
++        w32(0x30, 0x10);
++    } else {
++        error = wait_status(0x20);
++        if (error) { return error; }
++        for (unsigned int i = 0; i < 128; i++) {
++            uint32_t word = r32(0x20);
++            memcpy(data + i * 4, &word, 4);
++        }
++        w32(0x30, 0x20);
++    }
+     error = wait_status(2);
+     w32(0x30, 2);
+     return error;
+@@ -106,6 +127,32 @@
+ static int read_sector(uint64_t lba, uint8_t *data) {
+     if (lba >= ocean_sectors || lba > UINT32_MAX) { return EINVAL; }
+     return command(17, (uint32_t)lba, data);
++}
++static int write_sector(uint64_t lba, const uint8_t *data) {
++    /* Fence: only the iOS volume inside the verified userdata partition. */
++    if (!ocean_writable || ocean_first != OCEAN_USERDATA_FIRST ||
++        lba < ocean_first || lba >= ocean_first + ocean_length ||
++        lba > OCEAN_USERDATA_LAST) {
++        return EROFS;
++    }
++    uint8_t buffer[512];
++    memcpy(buffer, data, 512);
++    int error = command(24, (uint32_t)lba, buffer);
++    if (error) {
++        printf("OCEAN SDHCI: CMD24 lba=%llu failed (%d)\n", lba, error);
++        return error;
++    }
++    /* Transfer complete covers DAT0 busy; also wait for the card to leave
++     * the programming state before the next command. */
++    uint64_t start = ticks();
++    while ((error = command(13, 1U << 16, NULL)) == EBUSY) {
++        if (ticks() - start >= 19200000ULL * 2) {
++            printf("OCEAN SDHCI: programming timeout lba=%llu\n", lba);
++            return ETIMEDOUT;
++        }
++        __asm__ volatile("yield");
++    }
++    return error;
+ }
+ static uint32_t le32(const void *p) { uint32_t v; memcpy(&v,p,4); return v; }
+ static uint64_t le64(const void *p) { uint64_t v; memcpy(&v,p,8); return v; }
+@@ -445,7 +492,7 @@
+ }
+ 
+ static int sd_open(__unused dev_t d,int flags,__unused int type,__unused struct proc *p) {
+-    return !ocean_ready ? ENXIO : (flags & FWRITE) ? EROFS : 0;
++    return !ocean_ready ? ENXIO : ((flags & FWRITE) && !ocean_writable) ? EROFS : 0;
+ }
+ static int sd_close(__unused dev_t d,__unused int flags,__unused int type,__unused struct proc *p) { return 0; }
+ static void sd_strategy(buf_t bp) {
+@@ -453,19 +500,30 @@
+     uint64_t offset=0, length=ocean_length*512;
+     buf_setresid(bp,count);
+     if (!ocean_ready) { error=ENXIO; }
+-    else if (!(buf_flags(bp)&B_READ)) { error=EROFS; }
++    else if (!(buf_flags(bp)&B_READ) && !ocean_writable) { error=EROFS; }
+     else if (buf_blkno(bp)<0 || (uint64_t)buf_blkno(bp)>UINT64_MAX/ocean_blocksize) { error=EINVAL; }
+     else { offset=(uint64_t)buf_blkno(bp)*ocean_blocksize;
+         if (offset>length || count>length-offset) { error=EINVAL; } }
+     if (error || !count) { goto done; }
+     if (buf_map(bp,&address)) { error=EIO; goto done; }
++    bool reading=(buf_flags(bp)&B_READ)!=0;
+     lck_mtx_lock(&ocean_sd_lock);
+     for (uint32_t n=0;n<count;) {
+         uint8_t sector[512]; uint64_t pos=offset+n;
+         uint32_t skip=pos&511, take=MIN(count-n,512-skip);
+-        error=read_sector(ocean_first+pos/512,sector);
+-        if (error) { break; }
+-        memcpy(address+n,sector+skip,take); n+=take; buf_setresid(bp,count-n);
++        uint64_t lba=ocean_first+pos/512;
++        if (reading || take<512) {
++            /* Partial-sector writes read-modify-write the whole sector. */
++            error=read_sector(lba,sector);
++            if (error) { break; }
++        }
++        if (reading) { memcpy(address+n,sector+skip,take); }
++        else {
++            memcpy(sector+skip,address+n,take);
++            error=write_sector(lba,sector);
++            if (error) { break; }
++        }
++        n+=take; buf_setresid(bp,count-n);
+     }
+     lck_mtx_unlock(&ocean_sd_lock); buf_unmap(bp);
+ done:
+@@ -480,17 +538,19 @@
+         ocean_blocksize=v; return 0; }
+     case DKIOCGETPHYSICALBLOCKSIZE: *(uint32_t *)data=512; return 0;
+     case DKIOCGETBLOCKCOUNT: *(uint64_t *)data=ocean_length*512/ocean_blocksize; return 0;
+-    case DKIOCISWRITABLE: *(uint32_t *)data=0; return 0;
++    case DKIOCISWRITABLE: *(uint32_t *)data=ocean_writable ? 1 : 0; return 0;
+     case DKIOCGETMAXBLOCKCOUNTREAD: case DKIOCGETMAXSEGMENTCOUNTREAD:
+     case DKIOCGETMAXSEGMENTCOUNTWRITE: *(uint64_t *)data=1; return 0;
+-    case DKIOCGETMAXBLOCKCOUNTWRITE: *(uint64_t *)data=0; return 0;
++    case DKIOCGETMAXBLOCKCOUNTWRITE: *(uint64_t *)data=ocean_writable ? 1 : 0; return 0;
+     case DKIOCSYNCHRONIZE: case DKIOCSYNCHRONIZECACHE: return 0;
+     default: return ENOTTY;
+     }
+ }
+ static int sd_psize(__unused dev_t d) { return ocean_ready ? (int)MIN(ocean_length*512/ocean_blocksize,INT_MAX) : -1; }
+ static int sd_read(dev_t d,struct uio *u,__unused int flags) { return physio(sd_strategy,NULL,d,B_READ,minphys,u,(int)ocean_blocksize); }
+-static int sd_write(__unused dev_t d,__unused struct uio *u,__unused int flags) { return EROFS; }
++static int sd_write(dev_t d,struct uio *u,__unused int flags) {
++    return ocean_writable ? physio(sd_strategy,NULL,d,B_WRITE,minphys,u,(int)ocean_blocksize) : EROFS;
++}
+ static const struct bdevsw sd_bdevsw={ .d_open=sd_open,.d_close=sd_close,.d_strategy=sd_strategy,
+     .d_ioctl=sd_ioctl,.d_dump=eno_dump,.d_psize=sd_psize,.d_type=D_DISK };
+ static const struct cdevsw sd_cdevsw={ .d_open=sd_open,.d_close=sd_close,.d_read=sd_read,.d_write=sd_write,
+@@ -502,9 +562,14 @@
+         error=find_hfs(); if (error) { return error; }
+         int bmajor=bdevsw_add(-1,&sd_bdevsw); if (bmajor<0) { return ENXIO; }
+         int cmajor=cdevsw_add_with_bdev(-1,&sd_cdevsw,bmajor); if (cmajor<0) { return ENXIO; }
++        int write_optin=0;
++        PE_parse_boot_argn("ocean_emmcwrite",&write_optin,sizeof(write_optin));
++        ocean_writable=write_optin==1 && ocean_first==OCEAN_USERDATA_FIRST;
++        printf("OCEAN SDHCI: root %s\n",ocean_writable?"writable (CMD24, userdata only)":"read-only");
+         ocean_dev=makedev(bmajor,0); ocean_ready=true;
+-        devfs_make_node(ocean_dev,DEVFS_BLOCK,UID_ROOT,GID_OPERATOR,0440,"oceanroot0");
+-        devfs_make_node(makedev(cmajor,0),DEVFS_CHAR,UID_ROOT,GID_OPERATOR,0440,"roceanroot0");
++        int mode=ocean_writable?0640:0440;
++        devfs_make_node(ocean_dev,DEVFS_BLOCK,UID_ROOT,GID_OPERATOR,mode,"oceanroot0");
++        devfs_make_node(makedev(cmajor,0),DEVFS_CHAR,UID_ROOT,GID_OPERATOR,mode,"roceanroot0");
+     }
+     *dev=ocean_dev; return 0;
+ }
+diff --git a/bsd/vfs/vfs_subr.c b/bsd/vfs/vfs_subr.c
+--- a/bsd/vfs/vfs_subr.c
++++ b/bsd/vfs/vfs_subr.c
+@@ -1257,7 +1257,7 @@
+ 
+ 		mp = vfs_rootmountalloc_internal(vfsp, "root_device");
+ 		mp->mnt_devvp = rootvp;
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
++#if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_OCEAN)
+ 		/*
+ 		 * SWEET has no data volume: /private/var lives on the root, so
+ 		 * boot-arg rootrw=1 mounts it read-write from the start.
