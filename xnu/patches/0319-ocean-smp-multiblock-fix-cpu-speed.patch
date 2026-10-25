@@ -1,7 +1,7 @@
 diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
 --- a/bsd/dev/ocean_sdhci.c
 +++ b/bsd/dev/ocean_sdhci.c
-@@ -524,6 +524,20 @@
+@@ -524,6 +524,18 @@
      return error;
  }
  
@@ -11,18 +11,16 @@ diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
 +    uint64_t start = ticks(), iterations = 0;
 +    while (ticks() - start < 960000ULL) {
 +        uint64_t n = 100000;
-+        __asm__ volatile("1: subs %0, %0, #1
-+	b.ne 1b" : "+r"(n));
++        __asm__ volatile("1: subs %0, %0, #1\n\tb.ne 1b" : "+r"(n));
 +        iterations += 100000;
 +    }
-+    printf("OCEAN CPU: about %llu MHz (boot CPU loop estimate)
-+", iterations / 50000ULL);
++    printf("OCEAN CPU: about %llu MHz (boot CPU loop estimate)\n", iterations / 50000ULL);
 +}
 +
  /* Boot-arg ocean_fastclk=1: after identification at 400 kHz, run data
   * transfers from XO directly (19.2 MHz, default-speed timing, still one
   * bit). The GPT header must read back identically, else revert. */
-@@ -588,6 +602,26 @@
+@@ -588,6 +600,24 @@
      printf("OCEAN SDHCI: 4-bit data bus\n");
  }
  
@@ -33,15 +31,13 @@ diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
 +    do {
 +        uint32_t v = r32(0x30);
 +        if (v & 0xffff8000U) {
-+            printf("OCEAN SDHCI: error status=0x%08x present=0x%08x
-+", v, r32(0x24));
++            printf("OCEAN SDHCI: error status=0x%08x present=0x%08x\n", v, r32(0x24));
 +            return EIO;
 +        }
 +        if ((v & 0x20) || (r32(0x24) & 0x800)) { return 0; }
 +        __asm__ volatile("yield");
 +    } while (ticks() - start < 19200000ULL * 2);
-+    printf("OCEAN SDHCI: timeout waiting read buffer, status=0x%x present=0x%x
-+",
++    printf("OCEAN SDHCI: timeout waiting read buffer, status=0x%x present=0x%x\n",
 +        r32(0x30), r32(0x24));
 +    return ETIMEDOUT;
 +}
@@ -49,7 +45,7 @@ diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
  /* READ_MULTIPLE_BLOCK with Auto CMD12, PIO, 2..128 sectors. */
  #define OCEAN_MULTI_MAX 128
  static bool ocean_multiblock;
-@@ -615,7 +649,7 @@
+@@ -615,7 +645,7 @@
      w32(0x30, 1);
      if (response & 0xfff80000U) { return EIO; }
      for (uint32_t b = 0; b < n; b++) {
@@ -58,7 +54,7 @@ diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
          if (error) { return error; }
          uint8_t *p = data + (size_t)b * 512;
          for (unsigned int i = 0; i < 128; i++) {
-@@ -896,6 +930,7 @@
+@@ -896,6 +926,7 @@
      if (!ocean_ready) {
          int error=map_host(); if (error) { return error; }
          error=find_hfs(); if (error) { return error; }
