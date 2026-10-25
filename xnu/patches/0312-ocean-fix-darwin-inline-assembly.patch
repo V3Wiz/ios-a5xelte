@@ -1,0 +1,45 @@
+diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
+--- a/bsd/dev/ocean_sdhci.c
++++ b/bsd/dev/ocean_sdhci.c
+@@ -37,7 +37,7 @@
+ static void w32(unsigned int off, uint32_t v) { *(volatile uint32_t *)(ocean_regs + off) = v; }
+ static uint64_t ticks(void) {
+     uint64_t n;
+-    __asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(n));
++    __asm__ volatile("isb\n\tmrs %0, cntpct_el0" : "=r"(n));
+     return n;
+ }
+ static int wait_status(uint32_t mask) {
+@@ -122,11 +122,12 @@
+  * no PMIC, PLL, partition selection, SWITCH, erase or data-write operations.
+  * Motorola QPOS30.52 legacy-MCI controller offsets and DLL bypass sequence.
+  */
+-/* Validate runtime translation, including actual stage-1 memory type. */
++/* Darwin arm64 treats semicolons as comments: use explicit newlines.
++ * Validate runtime translation, including actual stage-1 memory type. */
+ static int audit_io(vm_offset_t va, uint64_t expected) {
+     uint64_t par, saved;
+-    __asm__ volatile("mrs %1, daif; msr daifset, #15; at s1e1r, %2; isb; "
+-        "mrs %0, par_el1; msr daif, %1"
++    __asm__ volatile("mrs %1, daif\n\tmsr daifset, #15\n\tat s1e1r, %2\n\tisb\n\t"
++        "mrs %0, par_el1\n\tmsr daif, %1"
+         : "=&r"(par), "=&r"(saved) : "r"(va) : "memory");
+     printf("OCEAN MAP: expected=%llx PAR=%llx\n", expected, par);
+     if ((par & 1) || (par & 0x0000fffffffff000ULL) != (expected & ~4095ULL) ||
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -447,11 +447,11 @@
+ #if defined(OCEAN)
+     uint64_t ocean_cntfrq, ocean_counter_a, ocean_counter_b;
+     __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(ocean_cntfrq));
+-    __asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(ocean_counter_a));
++    __asm__ volatile("isb\n\tmrs %0, cntpct_el0" : "=r"(ocean_counter_a));
+     for (unsigned int i = 0; i < 4096; i++) {
+         __asm__ volatile("nop");
+     }
+-    __asm__ volatile("isb; mrs %0, cntpct_el0" : "=r"(ocean_counter_b));
++    __asm__ volatile("isb\n\tmrs %0, cntpct_el0" : "=r"(ocean_counter_b));
+     if (ocean_cntfrq != 19200000 || ocean_counter_b <= ocean_counter_a ||
+         gPEClockFrequencyInfo.timebase_frequency_hz != ocean_cntfrq) {
+         panic("OCEAN: physical counter or ADT timebase mismatch");

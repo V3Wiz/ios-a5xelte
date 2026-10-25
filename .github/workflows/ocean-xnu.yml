@@ -98,6 +98,12 @@ jobs:
           set -o pipefail
           bash build.sh 2>&1 | tee ../build.log
 
+      - name: Verify compiled Ocean timer and translation instructions
+        run: |
+          archive=$(find dxb/fakeroot/System/Library/Kernels -name 'kernel.development.ocean.a' -print -quit)
+          test -n "$archive"
+          python3 tools/check-ocean-asm.py "$archive"
+
       - name: Check production eMMC init with injected register faults
         run: python3 tools/test-ocean-init-model.py
 
