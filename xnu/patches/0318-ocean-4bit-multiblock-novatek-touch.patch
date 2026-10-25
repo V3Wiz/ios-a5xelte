@@ -1,0 +1,484 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -107,6 +107,7 @@
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/a5xelte_emmc.c			standard
+ bsd/dev/ocean_sdhci.c			standard
++bsd/dev/ocean_touch.c			standard
+ bsd/dev/herolte_ufs.c			standard
+ bsd/dev/herolte_touch.c			standard
+ bsd/dev/a5xelte_keys.c			standard
+diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
+--- a/bsd/dev/ocean_sdhci.c
++++ b/bsd/dev/ocean_sdhci.c
+@@ -29,6 +29,7 @@
+ extern int hz;
+ /* Console ring fed by _cnputs (bsd/dev/a5xelte_emmc.c). */
+ extern void a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total);
++extern void ocean_touch_start(void); /* bsd/dev/ocean_touch.c */
+ int ocean_sdhci_rootdev(dev_t *);
+ static vm_offset_t ocean_regs;
+ static uint64_t ocean_sectors, ocean_first, ocean_length;
+@@ -73,7 +74,10 @@
+      * READ_SINGLE_BLOCK and, once enabled, WRITE_BLOCK. No CMD25, SWITCH,
+      * erase or partition-selection command can be issued. */
+     bool is_write = cmd == 24;
+-    if (!((cmd == 13 && data == NULL) || (cmd == 12 && data == NULL) ||
++    /* CMD6 SWITCH: only EXT_CSD[183] BUS_WIDTH = 4-bit or back to 1-bit. */
++    bool bus_switch = cmd == 6 && data == NULL &&
++        (arg == 0x03b70100U || arg == 0x03b70000U);
++    if (!((cmd == 13 && data == NULL) || (cmd == 12 && data == NULL) || bus_switch ||
+         (cmd == 17 && data != NULL) ||
+         (is_write && data != NULL && ocean_writable))) {
+         return EINVAL;
+@@ -94,8 +98,9 @@
+     }
+     w32(0x08, arg);
+     __asm__ volatile("dsb sy" ::: "memory");
+-    /* CMD12 is R1b: busy on DAT0 until the card finishes. */
+-    w16(0x0e, (uint16_t)((cmd << 8) | (cmd == 12 ? 0x1bU : 0x1aU) | (data ? 0x20U : 0)));
++    /* CMD12 and CMD6 are R1b: busy on DAT0 until the card finishes. */
++    bool r1b = cmd == 12 || cmd == 6;
++    w16(0x0e, (uint16_t)((cmd << 8) | (r1b ? 0x1bU : 0x1aU) | (data ? 0x20U : 0)));
+     int error;
+     if (is_write) {
+         /* test20 saw Buffer Write Ready without Command Complete on this
+@@ -124,9 +129,10 @@
+     uint32_t response = r32(0x10);
+     w32(0x30, 1);
+     ocean_last_r1 = response;
+-    if (cmd == 12) {
++    if (r1b) {
+         error = wait_status(2);
+         w32(0x30, 2);
++        if (!error && cmd == 6 && (response & 0xfff80000U)) { error = EIO; }
+         return error;
+     }
+     if (response & 0xfff80000U) {
+@@ -545,6 +551,106 @@
+     printf("OCEAN CLOCK: data transfers at XO 19.2 MHz cfg=%x\n", gcc[0x42008 / 4]);
+ }
+ 
++static int wait_transfer_state(void) {
++    uint64_t start = ticks();
++    int error;
++    while ((error = command(13, 1U << 16, NULL)) == EBUSY) {
++        if (ticks() - start >= 19200000ULL * 2) { return ETIMEDOUT; }
++        __asm__ volatile("yield");
++    }
++    return error;
++}
++
++/* Boot-arg ocean_4bit=1: EXT_CSD BUS_WIDTH 4-bit (default-speed timing
++ * unchanged). The GPT header must read back identically, else revert. */
++static void bus_width_4(void) {
++    int optin = 0;
++    PE_parse_boot_argn("ocean_4bit", &optin, sizeof(optin));
++    if (optin != 1) { return; }
++    uint8_t before[512], after[512];
++    if (read_sector(1, before)) { return; }
++    int error = command(6, 0x03b70100U, NULL);
++    if (!error) { error = wait_transfer_state(); }
++    if (!error && (ocean_last_r1 & 0x80)) { error = EIO; } /* SWITCH_ERROR */
++    if (!error) {
++        w8(0x28, r8(0x28) | 0x02); /* Host 4-bit data width. */
++        error = read_sector(1, after);
++        if (!error && memcmp(before, after, sizeof(before))) { error = EIO; }
++    }
++    if (error) {
++        printf("OCEAN SDHCI: 4-bit bus failed (%d) R1=0x%x, back to 1-bit\n", error, ocean_last_r1);
++        w8(0x28, r8(0x28) & ~0x02);
++        recover();
++        command(6, 0x03b70000U, NULL);
++        wait_transfer_state();
++        return;
++    }
++    printf("OCEAN SDHCI: 4-bit data bus\n");
++}
++
++/* READ_MULTIPLE_BLOCK with Auto CMD12, PIO, 2..128 sectors. */
++#define OCEAN_MULTI_MAX 128
++static bool ocean_multiblock;
++static uint32_t ocean_multi_failures;
++
++static int read_blocks(uint64_t lba, uint32_t n, uint8_t *data) {
++    if (n < 2 || n > OCEAN_MULTI_MAX || lba + n > ocean_sectors || lba + n > UINT32_MAX) {
++        return EINVAL;
++    }
++    uint64_t start = ticks();
++    while (r32(0x24) & 3U) {
++        if (ticks() - start >= 19200000ULL * 2) { return EBUSY; }
++        __asm__ volatile("yield");
++    }
++    w32(0x30, 0xffffffffU);
++    w16(0x04, 512);
++    w16(0x06, (uint16_t)n);
++    w16(0x0c, 0x36); /* Multi, read, Auto CMD12, block count. */
++    w32(0x08, (uint32_t)lba);
++    __asm__ volatile("dsb sy" ::: "memory");
++    w16(0x0e, (uint16_t)((18U << 8) | 0x3aU));
++    int error = wait_status(1);
++    if (error) { return error; }
++    uint32_t response = r32(0x10);
++    w32(0x30, 1);
++    if (response & 0xfff80000U) { return EIO; }
++    for (uint32_t b = 0; b < n; b++) {
++        error = wait_status(0x20);
++        if (error) { return error; }
++        uint8_t *p = data + (size_t)b * 512;
++        for (unsigned int i = 0; i < 128; i++) {
++            uint32_t word = r32(0x20);
++            memcpy(p + i * 4, &word, 4);
++        }
++        w32(0x30, 0x20);
++    }
++    error = wait_status(2);
++    w32(0x30, 2);
++    return error;
++}
++
++/* Boot-arg ocean_multiread=1, enabled only if sectors 0..3 match the
++ * single-block reads. */
++static void multiblock_enable(void) {
++    int optin = 0;
++    PE_parse_boot_argn("ocean_multiread", &optin, sizeof(optin));
++    if (optin != 1) { return; }
++    static uint8_t single[4 * 512], multi[4 * 512];
++    int error = 0;
++    for (unsigned int i = 0; i < 4 && !error; i++) {
++        error = read_sector(i, single + i * 512);
++    }
++    if (!error) { error = read_blocks(0, 4, multi); }
++    if (!error && memcmp(single, multi, sizeof(single))) { error = EIO; }
++    if (error) {
++        printf("OCEAN SDHCI: multi-block reads failed (%d), single-block only\n", error);
++        recover();
++        return;
++    }
++    ocean_multiblock = true;
++    printf("OCEAN SDHCI: multi-block reads up to %u sectors\n", OCEAN_MULTI_MAX);
++}
++
+ /* Explicit opt-in selects only the verified userdata geometry. */
+ static bool root_candidate(const char *name, uint64_t first, uint64_t last, int optin) {
+     if (!strcmp(name, "userdata")) {
+@@ -652,6 +758,17 @@
+         uint8_t sector[512]; uint64_t pos=offset+n;
+         uint32_t skip=pos&511, take=MIN(count-n,512-skip);
+         uint64_t lba=ocean_first+pos/512;
++        if (reading && ocean_multiblock && !skip && count-n>=1024) {
++            uint32_t k=MIN((count-n)/512,OCEAN_MULTI_MAX);
++            if (!read_blocks(lba,k,(uint8_t *)address+n)) {
++                n+=k*512; buf_setresid(bp,count-n); continue;
++            }
++            recover(); /* Then this sector goes the single-block way. */
++            if (++ocean_multi_failures >= 8) {
++                ocean_multiblock=false;
++                printf("OCEAN SDHCI: multi-block reads disabled after %u failures\n",ocean_multi_failures);
++            }
++        }
+         if (reading || take<512) {
+             /* Partial-sector writes read-modify-write the whole sector. */
+             error=read_sector(lba,sector);
+@@ -679,7 +796,10 @@
+     case DKIOCGETPHYSICALBLOCKSIZE: *(uint32_t *)data=512; return 0;
+     case DKIOCGETBLOCKCOUNT: *(uint64_t *)data=ocean_length*512/ocean_blocksize; return 0;
+     case DKIOCISWRITABLE: *(uint32_t *)data=ocean_writable ? 1 : 0; return 0;
+-    case DKIOCGETMAXBLOCKCOUNTREAD: case DKIOCGETMAXSEGMENTCOUNTREAD:
++    case DKIOCGETMAXBLOCKCOUNTREAD:
++        *(uint64_t *)data=ocean_multiblock ? OCEAN_MULTI_MAX*512/ocean_blocksize : 1; return 0;
++    case DKIOCGETMAXSEGMENTCOUNTREAD:
++        *(uint64_t *)data=ocean_multiblock ? OCEAN_MULTI_MAX*512/PAGE_SIZE : 1; return 0;
+     case DKIOCGETMAXSEGMENTCOUNTWRITE: *(uint64_t *)data=1; return 0;
+     case DKIOCGETMAXBLOCKCOUNTWRITE: *(uint64_t *)data=ocean_writable ? 1 : 0; return 0;
+     case DKIOCSYNCHRONIZE: case DKIOCSYNCHRONIZECACHE: return 0;
+@@ -777,6 +897,8 @@
+         int error=map_host(); if (error) { return error; }
+         error=find_hfs(); if (error) { return error; }
+         fast_clock();
++        bus_width_4();
++        multiblock_enable();
+         int bmajor=bdevsw_add(-1,&sd_bdevsw); if (bmajor<0) { return ENXIO; }
+         int cmajor=cdevsw_add_with_bdev(-1,&sd_cdevsw,bmajor); if (cmajor<0) { return ENXIO; }
+         int write_optin=0;
+@@ -788,6 +910,7 @@
+         devfs_make_node(ocean_dev,DEVFS_BLOCK,UID_ROOT,GID_OPERATOR,mode,"oceanroot0");
+         devfs_make_node(makedev(cmajor,0),DEVFS_CHAR,UID_ROOT,GID_OPERATOR,mode,"roceanroot0");
+         log_start();
++        ocean_touch_start();
+     }
+     *dev=ocean_dev; return 0;
+ }
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -434,7 +434,12 @@
+ 	}
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#if defined(ARM64_BOARD_CONFIG_OCEAN)
++	/* bsd/dev/ocean_touch.c already maps Novatek points onto the iPhone X
++	 * canvas that AppleCLCD scales to the panel. */
++	fPanelW = fLogicalW = 1125;
++	fPanelH = fLogicalH = 2436;
++#elif defined(ARM64_BOARD_CONFIG_HEROLTE)
+ 	/* sec_ts reports 1440x2560 panel pixels; same geometry as AppleCLCD. */
+ 	fPanelW = 1440;
+ 	fPanelH = 2560;
+diff --git a/bsd/dev/ocean_touch.c b/bsd/dev/ocean_touch.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/ocean_touch.c
+@@ -0,0 +1,250 @@
++/* OCEAN Novatek NT36xxx touch over BLSP1 QUP3 I2C (78b7000), polled.
++ *
++ * Moto ocean live FDT: /soc/i2c@78b7000/novatek@62 ("novatek,NVT-ts"),
++ * irq gpio 65, max 720x1520, no supplies (TDDI: powered with the panel).
++ * Motorola's nt36xxx.c reads the event buffer with CTP_I2C_READ at
++ * I2C_FW_Address 0x01: write register 0x00, repeated start, read; each
++ * finger is 6 bytes (id<<3|status, x>>4, y>>4, x&15<<4|y&15, w, p).
++ * QUP register use follows Motorola's i2c-msm-v2.c FIFO mode (tags v2,
++ * 2-byte input tag per read chunk). Clocks: BLSP1 AHB vote bit 10,
++ * BLSP1_QUP3_I2C_APPS RCG 0x4000 / CBCR 0x4020; pins gpio10/11 function 2.
++ *
++ * The only bytes sent to the touch chip are its event register address.
++ * Boot-arg ocean_touch=1 enables it.
++ */
++#if defined(ARM64_BOARD_CONFIG_OCEAN)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/sched_prim.h>
++#include <pexpert/pexpert.h>
++#include <libkern/libkern.h>
++#include <mach/mach_time.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int hz;
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void ocean_touch_start(void);
++
++#define QUP_PA          0x078b7000
++#define GCC_PA          0x01800000
++#define TLMM_PA         0x01000000
++#define NVT_ADDR        0x01            /* I2C_FW_Address */
++#define NVT_FINGERS     5
++#define NVT_READ        (NVT_FINGERS * 6)
++#define NVT_MAX_X       720
++#define NVT_MAX_Y       1520
++/* Same mapping as the display: iPhone X canvas scaled to 704x1520 at x=8. */
++#define CANVAS_W        1125
++#define CANVAS_H        2436
++#define SCAN_W          704
++#define SCAN_X          8
++
++enum {
++    QUP_CONFIG = 0x0, QUP_STATE = 0x4, QUP_IO_MODES = 0x8, QUP_SW_RESET = 0xc,
++    QUP_OPERATIONAL = 0x18, QUP_ERROR_FLAGS = 0x1c, QUP_ERROR_FLAGS_EN = 0x20,
++    QUP_OPERATIONAL_MASK = 0x28, QUP_MX_OUTPUT_COUNT = 0x100,
++    QUP_OUT_FIFO_BASE = 0x110, QUP_MX_WRITE_COUNT = 0x150,
++    QUP_MX_INPUT_COUNT = 0x200, QUP_MX_READ_COUNT = 0x208, QUP_IN_FIFO_BASE = 0x218,
++    QUP_I2C_MASTER_CLK_CTL = 0x400, QUP_I2C_STATUS = 0x404, QUP_I2C_MASTER_CONFIG = 0x408,
++};
++
++static vm_offset_t qup;
++static int touch_chan;
++static uint32_t touch_errors;
++
++static uint32_t qr(unsigned int off) { return *(volatile uint32_t *)(qup + off); }
++static void qw(unsigned int off, uint32_t v) {
++    *(volatile uint32_t *)(qup + off) = v;
++    __asm__ volatile("dsb sy" ::: "memory");
++}
++static uint64_t ticks(void) {
++    uint64_t n;
++    __asm__ volatile("isb\n\tmrs %0, cntpct_el0" : "=r"(n));
++    return n;
++}
++
++static int qup_state(uint32_t state) {
++    qw(QUP_STATE, state);
++    uint64_t start = ticks();
++    for (;;) {
++        uint32_t s = qr(QUP_STATE);
++        if ((s & 4) && (s & 3) == state) { return 0; }
++        if (ticks() - start > 1920000ULL) {
++            printf("OCEAN TOUCH: QUP state %u timeout (state=0x%x)\n", state, s);
++            return ETIMEDOUT;
++        }
++    }
++}
++
++static int clocks_and_pins(void) {
++    volatile uint32_t *gcc = (volatile uint32_t *)ml_io_map(GCC_PA, 0x80000);
++    volatile uint32_t *pin10 = (volatile uint32_t *)ml_io_map(TLMM_PA + 10 * 0x1000, 0x1000);
++    volatile uint32_t *pin11 = (volatile uint32_t *)ml_io_map(TLMM_PA + 11 * 0x1000, 0x1000);
++    if (!gcc || !pin10 || !pin11) { return ENXIO; }
++    printf("OCEAN TOUCH: before vote=%x rcg=%x/%x cbcr=%x gpio10=%x gpio11=%x\n",
++        gcc[0x45004 / 4], gcc[0x4000 / 4], gcc[0x4004 / 4], gcc[0x4020 / 4], pin10[0], pin11[0]);
++    gcc[0x45004 / 4] |= 1U << 10;               /* BLSP1 AHB vote. */
++    __asm__ volatile("dsb sy" ::: "memory");
++    if ((gcc[0x4004 / 4] & 0x71f) != 0) {      /* RCG: XO, no divider. */
++        gcc[0x4004 / 4] &= ~0x371fU;
++        __asm__ volatile("dsb sy" ::: "memory");
++        gcc[0x4000 / 4] |= 1;
++        uint64_t start = ticks();
++        while (gcc[0x4000 / 4] & 1) {
++            if (ticks() - start > 1920000ULL) { return ETIMEDOUT; }
++        }
++    }
++    gcc[0x4020 / 4] |= 1;                       /* QUP3 I2C apps clock on. */
++    __asm__ volatile("dsb sy" ::: "memory");
++    uint64_t start = ticks();
++    while (gcc[0x4020 / 4] & 0x80000000U) {
++        if (ticks() - start > 1920000ULL) {
++            printf("OCEAN TOUCH: QUP3 clock stays off cbcr=%x\n", gcc[0x4020 / 4]);
++            return ETIMEDOUT;
++        }
++    }
++    /* Function 2 (blsp_i2c3), 2 mA, no pull: as the FDT i2c_3_active state. */
++    pin10[0] = (pin10[0] & ~0x3ffU) | (2U << 2);
++    pin11[0] = (pin11[0] & ~0x3ffU) | (2U << 2);
++    __asm__ volatile("dsb sy" ::: "memory");
++    printf("OCEAN TOUCH: after vote=%x rcg=%x/%x cbcr=%x gpio10=%x gpio11=%x\n",
++        gcc[0x45004 / 4], gcc[0x4000 / 4], gcc[0x4004 / 4], gcc[0x4020 / 4], pin10[0], pin11[0]);
++    return 0;
++}
++
++static int qup_init(void) {
++    qup = ml_io_map(QUP_PA, 0x600);
++    if (!qup) { return ENXIO; }
++    qw(QUP_SW_RESET, 1);
++    int error = qup_state(0);
++    if (error) { return error; }
++    qw(QUP_CONFIG, 0x200 | 7);                  /* I2C mini-core, N=8 bits. */
++    qw(QUP_ERROR_FLAGS_EN, 0x3c);
++    qw(QUP_OPERATIONAL_MASK, (1U << 9) | (1U << 8));
++    qw(QUP_I2C_MASTER_CONFIG, 1);               /* Tags version 2. */
++    printf("OCEAN TOUCH: QUP state=%x io_modes=%x i2c_status=%x\n",
++        qr(QUP_STATE), qr(QUP_IO_MODES), qr(QUP_I2C_STATUS));
++    return 0;
++}
++
++/* Write register reg, repeated start, read n bytes from addr (n <= 64). */
++static int i2c_read(uint8_t addr, uint8_t reg, uint8_t *data, unsigned int n) {
++    uint8_t out[12] = {
++        0x81, (uint8_t)(addr << 1), 0x82, 1, reg,           /* START, WRITE 1 */
++        0x81, (uint8_t)((addr << 1) | 1), 0x87, (uint8_t)n, /* START, READ_N_STOP */
++    };
++    unsigned int out_len = 9, in_len = n + 2;   /* 2-byte input tag. */
++    int error = qup_state(0);
++    if (error) { return error; }
++    qw(QUP_MX_INPUT_COUNT, 0);
++    qw(QUP_MX_OUTPUT_COUNT, 0);
++    qw(QUP_MX_READ_COUNT, in_len);
++    qw(QUP_MX_WRITE_COUNT, out_len);
++    qw(QUP_CONFIG, 0x200 | 7);
++    qw(QUP_IO_MODES, (qr(QUP_IO_MODES) & ~0x1fc00U) | (1U << 15) | (1U << 14));
++    qw(QUP_OPERATIONAL_MASK, 0);
++    if ((error = qup_state(1))) { return error; }
++    qw(QUP_I2C_MASTER_CLK_CTL, (62U << 16) | 124U); /* 100 kHz from 19.2 MHz. */
++    if ((error = qup_state(3))) { return error; }
++    for (unsigned int i = 0; i < out_len; i += 4) {
++        uint32_t word;
++        memcpy(&word, out + i, 4);
++        qw(QUP_OUT_FIFO_BASE, word);
++    }
++    if ((error = qup_state(1))) { return error; }
++    uint8_t in[72];
++    unsigned int got = 0;
++    uint64_t start = ticks();
++    while (got < in_len) {
++        uint32_t status = qr(QUP_I2C_STATUS), flags = qr(QUP_ERROR_FLAGS);
++        if ((status & 0x380003cU) || (flags & 0x3cU)) {
++            if (touch_errors++ < 6) {
++                printf("OCEAN TOUCH: I2C error status=%x flags=%x op=%x got=%u\n",
++                    status, flags, qr(QUP_OPERATIONAL), got);
++            }
++            qw(QUP_ERROR_FLAGS, flags);
++            qup_state(0);
++            return EIO;
++        }
++        if (qr(QUP_OPERATIONAL) & (1U << 5)) {  /* Input FIFO not empty. */
++            uint32_t word = qr(QUP_IN_FIFO_BASE);
++            unsigned int take = MIN(4U, in_len - got);
++            memcpy(in + got, &word, take);
++            got += take;
++            continue;
++        }
++        if (ticks() - start > 1920000ULL) {     /* 100 ms. */
++            if (touch_errors++ < 6) {
++                printf("OCEAN TOUCH: I2C timeout status=%x op=%x got=%u\n",
++                    status, qr(QUP_OPERATIONAL), got);
++            }
++            qup_state(0);
++            return ETIMEDOUT;
++        }
++    }
++    qw(QUP_OPERATIONAL, qr(QUP_OPERATIONAL) & 0xf00U); /* Clear service/done flags. */
++    qup_state(0);
++    memcpy(data, in + 2, n);
++    return 0;
++}
++
++static void touch_thread(__unused void *arg, __unused wait_result_t wr) {
++    uint8_t buf[NVT_READ];
++    bool down[NVT_FINGERS] = { false };
++    unsigned int logged = 0, ok = 0;
++    if (clocks_and_pins() || qup_init()) {
++        printf("OCEAN TOUCH: controller setup failed\n");
++        return;
++    }
++    uint8_t fw[2];
++    if (!i2c_read(NVT_ADDR, 0x78, fw, sizeof(fw))) {    /* EVENT_MAP_FWINFO */
++        printf("OCEAN TOUCH: Novatek fw info %02x %02x\n", fw[0], fw[1]);
++    }
++    for (;;) {
++        (void)tsleep(&touch_chan, PZERO, "oceantouch", MAX(1, hz / 50));
++        if (i2c_read(NVT_ADDR, 0x00, buf, sizeof(buf))) {
++            if (touch_errors > 6) { (void)tsleep(&touch_chan, PZERO, "oceantouch", hz); }
++            continue;
++        }
++        if (ok++ == 0 || (logged < 8 && (buf[0] & 7))) {
++            logged++;
++            printf("OCEAN TOUCH: raw %02x %02x %02x %02x %02x %02x | %02x %02x %02x %02x %02x %02x\n",
++                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5],
++                buf[6], buf[7], buf[8], buf[9], buf[10], buf[11]);
++        }
++        bool seen[NVT_FINGERS] = { false };
++        for (unsigned int i = 0; i < NVT_FINGERS; i++) {
++            const uint8_t *p = buf + 6 * i;
++            unsigned int id = p[0] >> 3, status = p[0] & 7;
++            if (id == 0 || id > NVT_FINGERS || (status != 1 && status != 2)) { continue; }
++            int x = (p[1] << 4) | (p[3] >> 4), y = (p[2] << 4) | (p[3] & 15);
++            if (x >= NVT_MAX_X || y >= NVT_MAX_Y) { continue; }
++            int lx = (x - SCAN_X) * CANVAS_W / SCAN_W, ly = y * CANVAS_H / NVT_MAX_Y;
++            lx = lx < 0 ? 0 : (lx >= CANVAS_W ? CANVAS_W - 1 : lx);
++            seen[id - 1] = true;
++            down[id - 1] = true;
++            sweet_hid_touch((int)id - 1, 1, lx, ly);
++        }
++        for (unsigned int f = 0; f < NVT_FINGERS; f++) {
++            if (down[f] && !seen[f]) {
++                down[f] = false;
++                sweet_hid_touch((int)f, 0, 0, 0);
++            }
++        }
++    }
++}
++
++void ocean_touch_start(void) {
++    int enabled = 0;
++    thread_t thread;
++    PE_parse_boot_argn("ocean_touch", &enabled, sizeof(enabled));
++    if (enabled != 1) { return; }
++    printf("OCEAN TOUCH: Novatek poll thread starting\n");
++    if (kernel_thread_start(touch_thread, NULL, &thread) == KERN_SUCCESS) {
++        thread_deallocate(thread);
++    }
++}
++#endif
