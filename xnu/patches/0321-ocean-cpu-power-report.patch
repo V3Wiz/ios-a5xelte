@@ -1,0 +1,128 @@
+diff --git a/bsd/dev/ocean_touch.c b/bsd/dev/ocean_touch.c
+--- a/bsd/dev/ocean_touch.c
++++ b/bsd/dev/ocean_touch.c
+@@ -66,33 +66,98 @@
+ #define SPMI_OBSRVR_PA  0x02c00000
+ #define PON_PPID        0x008           /* sid 0, peripheral 0x08 */
+ 
+-static int spmi_init(void) {
+-    volatile uint32_t *core = (volatile uint32_t *)ml_io_map(SPMI_CORE_PA, 0x1000);
+-    if (!core) { return ENXIO; }
++/* PMIC arbiter v2: observer (read-only) channel of peripheral ppid
++ * (sid << 8 | peripheral), from the channel table at core + 0x800. */
++static volatile uint32_t *spmi_channel(uint32_t ppid) {
++    static volatile uint32_t *core;
++    if (!core) { core = (volatile uint32_t *)ml_io_map(SPMI_CORE_PA, 0x1000); }
++    if (!core) { return NULL; }
+     for (unsigned int ch = 0; ch < 512; ch++) {
+-        if (((core[(0x800 + 4 * ch) / 4] >> 8) & 0xfff) == PON_PPID) {
+-            spmi_obs = (volatile uint32_t *)ml_io_map(SPMI_OBSRVR_PA + 0x8000 * ch, 0x1000);
+-            printf("OCEAN KEYS: PON on SPMI channel %u\n", ch);
+-            return spmi_obs ? 0 : ENXIO;
+-        }
+-    }
+-    printf("OCEAN KEYS: PON channel not found\n");
+-    return ENOENT;
+-}
+-
+-/* PMIC arbiter v2 observer read of one byte at PON offset off. */
+-static int pon_read(uint8_t off, uint8_t *value) {
+-    spmi_obs[0] = (1U << 27) | ((uint32_t)off << 4);   /* EXT_READL, 1 byte */
++        if (((core[(0x800 + 4 * ch) / 4] >> 8) & 0xfff) == ppid) {
++            return (volatile uint32_t *)ml_io_map(SPMI_OBSRVR_PA + 0x8000 * ch, 0x1000);
++        }
++    }
++    return NULL;
++}
++
++static int spmi_read(volatile uint32_t *obs, uint8_t off, uint8_t *value) {
++    obs[0] = (1U << 27) | ((uint32_t)off << 4);         /* EXT_READL, 1 byte */
+     __asm__ volatile("dsb sy" ::: "memory");
+     for (unsigned int i = 0; i < 10000; i++) {
+-        uint32_t status = spmi_obs[0x8 / 4];
++        uint32_t status = obs[0x8 / 4];
+         if (status & 1) {
+             if (status & 0xe) { return EIO; }
+-            *value = (uint8_t)spmi_obs[0x18 / 4];
++            *value = (uint8_t)obs[0x18 / 4];
+             return 0;
+         }
+     }
+     return ETIMEDOUT;
++}
++
++static int spmi_init(void) {
++    spmi_obs = spmi_channel(PON_PPID);
++    if (!spmi_obs) {
++        printf("OCEAN KEYS: PON channel not found\n");
++        return ENOENT;
++    }
++    return 0;
++}
++
++static int pon_read(uint8_t off, uint8_t *value) {
++    return spmi_read(spmi_obs, off, value);
++}
++
++/*
++ * Read-only CPU clock/voltage report, to plan DVFS: APCS PLLs (pwrcl
++ * 0xb116000, perfcl 0xb016000, CCI 0xb1d0000; MHz = 19.2 * (L + alpha)),
++ * cluster muxes/RCGs, the CPU rail pm8953 S5 (SPMI sid 1, 0x2000, SPM
++ * controlled), APM status and the mem-acc corner registers.
++ */
++static void cpu_power_report(void) {
++    static const struct { const char *name; uint32_t pa; } plls[] = {
++        { "pwrcl", 0xb116000 }, { "perfcl", 0xb016000 }, { "cci", 0xb1d0000 },
++    };
++    for (unsigned int i = 0; i < 3; i++) {
++        volatile uint32_t *pll = (volatile uint32_t *)ml_io_map(plls[i].pa, 0x1000);
++        if (!pll) { continue; }
++        uint32_t l = pll[0x8 / 4], alpha = pll[0x10 / 4];
++        printf("OCEAN CPU: %s pll mode=%x L=%u alpha=%x user=%x -> about %u MHz\n",
++            plls[i].name, pll[0], l, alpha, pll[0x18 / 4], (l * 192U + (alpha >> 24) * 192U / 256U) / 10U);
++    }
++    static const struct { const char *name; uint32_t pa; } rcgs[] = {
++        { "pwrcl", 0xb111050 }, { "perfcl", 0xb011050 }, { "cci", 0xb1d1050 },
++    };
++    for (unsigned int i = 0; i < 3; i++) {
++        volatile uint32_t *rcg = (volatile uint32_t *)ml_io_map(rcgs[i].pa & ~0xfffU, 0x1000);
++        if (!rcg) { continue; }
++        unsigned int off = (rcgs[i].pa & 0xfffU) / 4;
++        printf("OCEAN CPU: %s mux cmd=%x cfg=%x\n", rcgs[i].name, rcg[off], rcg[off + 1]);
++    }
++    volatile uint32_t *s5 = spmi_channel(0x120);
++    uint8_t v[8] = { 0 };
++    static const uint8_t regs[8] = { 0x04, 0x05, 0x40, 0x41, 0x42, 0x43, 0x45, 0x61 };
++    int bad = !s5;
++    for (unsigned int i = 0; i < 8 && !bad; i++) { bad = spmi_read(s5, regs[i], &v[i]); }
++    if (bad) {
++        printf("OCEAN CPU: S5 read failed\n");
++    } else {
++        unsigned int mv = 0;
++        if (v[0] == 0x1c) {                 /* FTS426 */
++            mv = (unsigned int)v[2] | ((unsigned int)v[3] << 8);  /* LB/UB in mV */
++        } else if (v[2] == 0) {             /* FTS2/2.5 range 0: 350 mV + 5 mV steps */
++            mv = 350 + 5 * v[3];
++        } else {                            /* range 1: 700 mV + 10 mV steps */
++            mv = 700 + 10 * v[3];
++        }
++        printf("OCEAN CPU: S5 type=%x sub=%x reg40=%x reg41=%x reg42=%x reg43=%x mode=%x step=%x -> about %u mV\n",
++            v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], mv);
++    }
++    volatile uint32_t *apm = (volatile uint32_t *)ml_io_map(0xb111000, 0x1000);
++    volatile uint32_t *acc = (volatile uint32_t *)ml_io_map(0xb1d1000, 0x1000);
++    if (apm && acc) {
++        printf("OCEAN CPU: APM status=%x mem-acc %x %x %x %x %x\n", apm[0x2b0 / 4],
++            acc[0x360 / 4], acc[0x364 / 4], acc[0x368 / 4], acc[0x36c / 4], acc[0x370 / 4]);
++    }
+ }
+ 
+ static void poll_keys(void) {
+@@ -265,6 +330,7 @@
+         printf("OCEAN TOUCH: controller setup failed\n");
+         return;
+     }
++    cpu_power_report();
+     if (spmi_init()) {
+         printf("OCEAN KEYS: power/volume down unavailable\n");
+     }
