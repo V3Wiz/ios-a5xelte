@@ -1,0 +1,155 @@
+diff --git a/bsd/dev/ocean_touch.c b/bsd/dev/ocean_touch.c
+--- a/bsd/dev/ocean_touch.c
++++ b/bsd/dev/ocean_touch.c
+@@ -11,6 +11,11 @@
+  *
+  * The only bytes sent to the touch chip are its event register address.
+  * Boot-arg ocean_touch=1 enables it.
++ *
++ * The same thread polls the buttons (FDT gpio_keys, qcom,power-on@800):
++ * volume up is TLMM gpio 85, active low; power (KPDPWR) and volume down
++ * (RESIN) are PM8953 PON real-time status bits 0/1 at SPMI sid 0, 0x810,
++ * read through the PMIC arbiter's observer channel (read-only).
+  */
+ #if defined(ARM64_BOARD_CONFIG_OCEAN)
+ #include <sys/param.h>
+@@ -26,6 +31,8 @@
+ extern void thread_deallocate(thread_t);
+ extern int hz;
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_hid_key(int key, int down);  /* 0 power, 1 vol up, 2 vol down */
++extern int sweet_fb_display_off;               /* SweetFramebuffer.cpp */
+ void ocean_touch_start(void);
+ 
+ #define QUP_PA          0x078b7000
+@@ -52,6 +59,65 @@
+ };
+ 
+ static vm_offset_t qup;
++static volatile uint32_t *spmi_obs;     /* observer channel for PON */
++static volatile uint32_t *volup_gpio;
++
++#define SPMI_CORE_PA    0x0200f000
++#define SPMI_OBSRVR_PA  0x02c00000
++#define PON_PPID        0x008           /* sid 0, peripheral 0x08 */
++
++static int spmi_init(void) {
++    volatile uint32_t *core = (volatile uint32_t *)ml_io_map(SPMI_CORE_PA, 0x1000);
++    if (!core) { return ENXIO; }
++    for (unsigned int ch = 0; ch < 512; ch++) {
++        if (((core[(0x800 + 4 * ch) / 4] >> 8) & 0xfff) == PON_PPID) {
++            spmi_obs = (volatile uint32_t *)ml_io_map(SPMI_OBSRVR_PA + 0x8000 * ch, 0x1000);
++            printf("OCEAN KEYS: PON on SPMI channel %u\n", ch);
++            return spmi_obs ? 0 : ENXIO;
++        }
++    }
++    printf("OCEAN KEYS: PON channel not found\n");
++    return ENOENT;
++}
++
++/* PMIC arbiter v2 observer read of one byte at PON offset off. */
++static int pon_read(uint8_t off, uint8_t *value) {
++    spmi_obs[0] = (1U << 27) | ((uint32_t)off << 4);   /* EXT_READL, 1 byte */
++    __asm__ volatile("dsb sy" ::: "memory");
++    for (unsigned int i = 0; i < 10000; i++) {
++        uint32_t status = spmi_obs[0x8 / 4];
++        if (status & 1) {
++            if (status & 0xe) { return EIO; }
++            *value = (uint8_t)spmi_obs[0x18 / 4];
++            return 0;
++        }
++    }
++    return ETIMEDOUT;
++}
++
++static void poll_keys(void) {
++    static bool pressed[3];
++    static uint32_t key_errors;
++    bool now[3] = { false, false, false };
++    uint8_t rt;
++    if (spmi_obs && !pon_read(0x10, &rt)) {
++        now[0] = (rt & 1) != 0;                 /* KPDPWR_N */
++        now[2] = (rt & 2) != 0;                 /* RESIN_N */
++    } else if (spmi_obs && key_errors++ < 4) {
++        printf("OCEAN KEYS: PON read failed\n");
++    }
++    if (volup_gpio) {
++        now[1] = (volup_gpio[1] & 1) == 0;      /* GPIO_IN_OUT, active low */
++    }
++    for (int k = 0; k < 3; k++) {
++        if (now[k] != pressed[k]) {
++            pressed[k] = now[k];
++            printf("OCEAN KEYS: %s %s\n", k == 0 ? "power" : (k == 1 ? "volume up" : "volume down"),
++                now[k] ? "down" : "up");
++            sweet_hid_key(k, now[k]);
++        }
++    }
++}
+ static int touch_chan;
+ static uint32_t touch_errors;
+ 
+@@ -199,12 +265,17 @@
+         printf("OCEAN TOUCH: controller setup failed\n");
+         return;
+     }
++    if (spmi_init()) {
++        printf("OCEAN KEYS: power/volume down unavailable\n");
++    }
++    volup_gpio = (volatile uint32_t *)ml_io_map(TLMM_PA + 85 * 0x1000, 0x1000);
+     uint8_t fw[2];
+     if (!i2c_read(NVT_ADDR, 0x78, fw, sizeof(fw))) {    /* EVENT_MAP_FWINFO */
+         printf("OCEAN TOUCH: Novatek fw info %02x %02x\n", fw[0], fw[1]);
+     }
+     for (;;) {
+         (void)tsleep(&touch_chan, PZERO, "oceantouch", MAX(1, hz / 50));
++        poll_keys();
+         if (i2c_read(NVT_ADDR, 0x00, buf, sizeof(buf))) {
+             if (touch_errors > 6) { (void)tsleep(&touch_chan, PZERO, "oceantouch", hz); }
+             continue;
+@@ -216,6 +287,24 @@
+                 buf[6], buf[7], buf[8], buf[9], buf[10], buf[11]);
+         }
+         bool seen[NVT_FINGERS] = { false };
++        /* Tap to wake: while backboardd has the display off, a new touch
++         * becomes a power-key press (iPhone X behaviour) and is swallowed
++         * until every finger lifts. */
++        static bool waking;
++        bool any = false;
++        for (unsigned int i = 0; i < NVT_FINGERS; i++) {
++            unsigned int status = buf[6 * i] & 7;
++            any |= (buf[6 * i] >> 3) != 0 && (status == 1 || status == 2);
++        }
++        if (waking || (sweet_fb_display_off && any)) {
++            if (!waking) {
++                printf("OCEAN TOUCH: tap to wake\n");
++                sweet_hid_key(0, 1);
++                sweet_hid_key(0, 0);
++            }
++            waking = any;
++            continue;
++        }
+         for (unsigned int i = 0; i < NVT_FINGERS; i++) {
+             const uint8_t *p = buf + 6 * i;
+             unsigned int id = p[0] >> 3, status = p[0] & 7;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,10 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++/* Display powered off by backboardd (RequestPowerChange 0); read by the
++ * Ocean touch driver to turn the first touch into a power-key wake. */
++extern "C" int sweet_fb_display_off;
++int sweet_fb_display_off;
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET) || defined(ARM64_BOARD_CONFIG_A5XELTE)
+ #include <IOKit/IOService.h>
+@@ -744,6 +748,7 @@
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
++				sweet_fb_display_off = off;
+ 				fFB->fFadeStep = 0;
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
