@@ -1,0 +1,36 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -80,9 +80,16 @@
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
+-#if defined(HEROLTE) || defined(OCEAN)
+-	/* Logical 0..3 = the boot CPU's cluster: MPIDR 0x100..0x103 on herolte,
+-	 * 0x0..0x3 on ocean (PSCI 1.0, SMC). */
++#if defined(OCEAN)
++	/* Logical 0..3 = the boot cluster, MPIDR 0x0..0x3; 4..7 = the Gold
++	 * cluster, MPIDR 0x100..0x103. Every core starts with PSCI 1.0 (SMC). */
++	uint32_t expected = cpu->cpu_id < 4 ? cpu->cpu_id : 0x100 + (cpu->cpu_id - 4);
++	if (cpu->phys_id != expected || topology->num_cpus > SWEET_SMP_MAX_CPUS) {
++		panic(CPU_PORT_NAME " CPU: unsupported topology cpu=%u mpidr=0x%x count=%u",
++		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
++	}
++#elif defined(HEROLTE)
++	/* Logical 0..3 = MPIDR 0x100..0x103, the boot CPU's A53 cluster. */
+ 	if (cpu->phys_id != A5XELTE_BOOT_MPIDR + cpu->cpu_id ||
+ 	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+ 		panic(CPU_PORT_NAME " CPU: unsupported topology cpu=%u mpidr=0x%x count=%u",
+diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
+--- a/pexpert/pexpert/arm64/A5XELTE.h
++++ b/pexpert/pexpert/arm64/A5XELTE.h
+@@ -15,7 +15,8 @@
+  * Only the explicit early OCEAN branch in start.s is permitted to run.
+  * Generic A5XELTE compatibility names do not imply Samsung device support. */
+ #define OCEAN                        1
+-#define SWEET_SMP_MAX_CPUS            4
++/* Logical 0..3 boot cluster (MPIDR 0x0..0x3), 4..7 Gold (0x100..0x103). */
++#define SWEET_SMP_MAX_CPUS            8
+ #define A5XELTE_FB_PA                 0x90001000
+ #define A5XELTE_FB_WIDTH              720
+ #define A5XELTE_FB_HEIGHT             1520
