@@ -1,0 +1,196 @@
+diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
+--- a/bsd/dev/ocean_sdhci.c
++++ b/bsd/dev/ocean_sdhci.c
+@@ -17,12 +17,18 @@
+ #include <sys/uio.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
++#include <kern/sched_prim.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
+ #include <mach/mach_time.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int hz;
++/* Console ring fed by _cnputs (bsd/dev/a5xelte_emmc.c). */
++extern void a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total);
+ int ocean_sdhci_rootdev(dev_t *);
+ static vm_offset_t ocean_regs;
+ static uint64_t ocean_sectors, ocean_first, ocean_length;
+@@ -107,8 +113,8 @@
+         w32(0x30, 3);
+         if (error) { return error; }
+         uint32_t response = r32(0x10);
++        ocean_last_r1 = response;
+         if (response & 0xfff80000U) {
+-            printf("OCEAN SDHCI: CMD24 R1 error=0x%x\n", response);
+             return EIO;
+         }
+         return 0;
+@@ -181,6 +187,45 @@
+     }
+     return error;
+ }
++/* R1 bits eMMC reports for the PREVIOUS command (COM_CRC_ERROR,
++ * ILLEGAL_COMMAND). test21 printed CMD24 R1 errors yet kept booting. */
++#define OCEAN_R1_PREVIOUS 0x00c00000U
++static uint32_t ocean_stale_r1_logged;
++
++/* Callers fence lba; ocean_sd_lock held. */
++static int program_sector(uint64_t lba, const uint8_t *data) {
++    uint8_t buffer[512], check[512];
++    memcpy(buffer, data, 512);
++    int error = 0;
++    for (int attempt = 0; attempt < 3; attempt++) {
++        error = command(24, (uint32_t)lba, buffer);
++        uint32_t r1 = ocean_last_r1;
++        if (!error || error == EIO) {
++            /* Transfer complete covers DAT0 busy; also wait for the card to
++             * leave the programming state before the next command. */
++            int ready;
++            uint64_t start = ticks();
++            while ((ready = command(13, 1U << 16, NULL)) == EBUSY) {
++                if (ticks() - start >= 19200000ULL * 2) { ready = ETIMEDOUT; break; }
++                __asm__ volatile("yield");
++            }
++            if (!error && !ready) { return 0; }
++            if (error == EIO && !ready && !(r1 & 0xfff80000U & ~OCEAN_R1_PREVIOUS) &&
++                !command(17, (uint32_t)lba, check) && !memcmp(check, buffer, 512)) {
++                if (ocean_stale_r1_logged++ < 32) {
++                    printf("OCEAN SDHCI: CMD24 lba=%llu R1=0x%x previous-command flag, data verified\n",
++                        lba, r1);
++                }
++                return 0;
++            }
++            if (!error) { error = ready; }
++        }
++        printf("OCEAN SDHCI: CMD24 lba=%llu attempt %d failed (%d) R1=0x%x\n",
++            lba, attempt + 1, error, r1);
++        if (recover()) { break; }
++    }
++    return error;
++}
+ static int write_sector(uint64_t lba, const uint8_t *data) {
+     /* Fence: only the iOS volume inside the verified userdata partition. */
+     if (!ocean_writable || ocean_first != OCEAN_USERDATA_FIRST ||
+@@ -188,25 +233,7 @@
+         lba > OCEAN_USERDATA_LAST) {
+         return EROFS;
+     }
+-    uint8_t buffer[512];
+-    memcpy(buffer, data, 512);
+-    int error = 0;
+-    for (int attempt = 0; attempt < 3; attempt++) {
+-        error = command(24, (uint32_t)lba, buffer);
+-        if (!error) {
+-            /* Transfer complete covers DAT0 busy; also wait for the card to
+-             * leave the programming state before the next command. */
+-            uint64_t start = ticks();
+-            while ((error = command(13, 1U << 16, NULL)) == EBUSY) {
+-                if (ticks() - start >= 19200000ULL * 2) { error = ETIMEDOUT; break; }
+-                __asm__ volatile("yield");
+-            }
+-            if (!error) { return 0; }
+-        }
+-        printf("OCEAN SDHCI: CMD24 lba=%llu attempt %d failed (%d)\n", lba, attempt + 1, error);
+-        if (recover()) { break; }
+-    }
+-    return error;
++    return program_sector(lba, data);
+ }
+ static uint32_t le32(const void *p) { uint32_t v; memcpy(&v,p,4); return v; }
+ static uint64_t le64(const void *p) { uint64_t v; memcpy(&v,p,8); return v; }
+@@ -669,6 +696,82 @@
+ static const struct cdevsw sd_cdevsw={ .d_open=sd_open,.d_close=sd_close,.d_read=sd_read,.d_write=sd_write,
+     .d_ioctl=sd_ioctl,.d_stop=eno_stop,.d_reset=eno_reset,.d_ttys=NULL,.d_select=eno_select,
+     .d_mmap=eno_mmap,.d_strategy=eno_strat,.d_reserved_1=eno_getc,.d_reserved_2=eno_putc,.d_type=D_DISK };
++/*
++ * Persistent console log ("oceanlog"): every 2 s the new part of the console
++ * ring is written to the last 4 MiB + 512 B of userdata, far beyond the
++ * 20 GiB HFSX volume at its start. Sector 0 of that area is a header:
++ *   "OCEANLG1" | u32 version 1 | u32 ring size | u64 total bytes | u64 seq
++ * ring offset of byte n = n % ring size. Read it from TWRP with
++ * tools/ocean-log-pull.py. Needs ocean_emmcwrite=1; oceanlog=0 disables it.
++ */
++#define OCEAN_LOG_RING     (4u << 20)
++#define OCEAN_LOG_SECTORS  (1u + OCEAN_LOG_RING / 512u)
++#define OCEAN_LOG_FIRST    (OCEAN_USERDATA_LAST + 1 - OCEAN_LOG_SECTORS)
++static int ocean_log_chan;
++
++struct ocean_log_header {
++    char magic[8];
++    uint32_t version, size;
++    uint64_t total, seq;
++};
++
++static int log_write_sector(uint64_t lba, const uint8_t *data) {
++    /* Fence: only the log area, never the HFS volume. */
++    if (!ocean_writable || lba < OCEAN_LOG_FIRST || lba > OCEAN_USERDATA_LAST ||
++        lba < ocean_first + ocean_length) {
++        return EROFS;
++    }
++    return program_sector(lba, data);
++}
++
++static void log_thread(__unused void *arg, __unused wait_result_t wr) {
++    const char *ring;
++    uint32_t rsize;
++    uint64_t total, flushed = 0, seq = 0;
++    uint8_t sector[512];
++    for (;;) {
++        (void)tsleep(&ocean_log_chan, PZERO, "oceanlog", hz * 2);
++        a5xelte_log_snapshot(&ring, &rsize, &total);
++        if (total == flushed || rsize != OCEAN_LOG_RING) { continue; }
++        uint64_t pos = total - flushed >= rsize ? total - rsize : flushed;
++        int error = 0;
++        lck_mtx_lock(&ocean_sd_lock);
++        while (pos < total && !error) {
++            uint32_t block = (uint32_t)((pos % rsize) / 512u);
++            memcpy(sector, ring + (size_t)block * 512u, 512u);
++            error = log_write_sector(OCEAN_LOG_FIRST + 1u + block, sector);
++            pos += 512u - (pos & 511u);
++        }
++        if (!error) {
++            struct ocean_log_header h = {
++                .magic = { 'O', 'C', 'E', 'A', 'N', 'L', 'G', '1' },
++                .version = 1, .size = rsize, .total = total, .seq = ++seq,
++            };
++            memset(sector, 0, sizeof(sector));
++            memcpy(sector, &h, sizeof(h));
++            error = log_write_sector(OCEAN_LOG_FIRST, sector);
++        }
++        lck_mtx_unlock(&ocean_sd_lock);
++        if (error) {
++            printf("OCEAN LOG: write failed (%d), stopping\n", error);
++            return;
++        }
++        flushed = total;
++    }
++}
++
++static void log_start(void) {
++    int enabled = 1;
++    thread_t thread;
++    PE_parse_boot_argn("oceanlog", &enabled, sizeof(enabled));
++    if (!enabled || !ocean_writable) { return; }
++    printf("OCEAN LOG: console ring to userdata sectors %llu..%llu\n",
++        (uint64_t)OCEAN_LOG_FIRST, (uint64_t)OCEAN_USERDATA_LAST);
++    if (kernel_thread_start(log_thread, NULL, &thread) == KERN_SUCCESS) {
++        thread_deallocate(thread);
++    }
++}
++
+ int ocean_sdhci_rootdev(dev_t *dev) {
+     if (!ocean_ready) {
+         int error=map_host(); if (error) { return error; }
+@@ -684,6 +787,7 @@
+         int mode=ocean_writable?0640:0440;
+         devfs_make_node(ocean_dev,DEVFS_BLOCK,UID_ROOT,GID_OPERATOR,mode,"oceanroot0");
+         devfs_make_node(makedev(cmajor,0),DEVFS_CHAR,UID_ROOT,GID_OPERATOR,mode,"roceanroot0");
++        log_start();
+     }
+     *dev=ocean_dev; return 0;
+ }
