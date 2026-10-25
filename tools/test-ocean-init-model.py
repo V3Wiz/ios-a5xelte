@@ -10,6 +10,8 @@ s=re.sub(r'__asm__ volatile\(".*?"(?:\s*:::\s*"memory")?\);','/* host model barr
 assert '__asm__' not in s
 prefix=r'''
 #include <stdint.h>
+#include <stdbool.h>
+typedef uintptr_t vm_offset_t;
 #include <stdio.h>
 #include <string.h>
 #include <assert.h>
@@ -40,6 +42,7 @@ static uintptr_t ml_io_map(uintptr_t pa,unsigned n) {
  if(pa==0x01800000 && n==0x80000)return (uintptr_t)gcc_mem;
  assert(0);return 0;
 }
+static int audit_io(uintptr_t va,uint64_t pa){(void)va;(void)pa;return 0;}
 static uint64_t ticks(void) {
  counter+=19200;
  if(fault!=2 && host[0x2f]){host[0x2f]=0;phase=1;core_mem[0x78/4]=1;}
@@ -66,8 +69,9 @@ static int run(int mode) {
  w32(0x10c,0x358b1c);gcc_mem[0x42008/4]=mode==8 ? 0x999:0x205;
  gcc_mem[0x42018/4]=mode==9 ? 0:1;gcc_mem[0x4201c/4]=1;
  gcc_mem[0x42004/4]=0x80000000U;
+ if(mode==11){gcc_mem[0x42008/4]=0x2017;gcc_mem[0x42004/4]=2;gcc_mem[0x4200c/4]=1;gcc_mem[0x42010/4]=252;gcc_mem[0x42014/4]=251;}
  int error=initialize_card();
- if(mode==0) {
+ if(mode==0 || mode==11) {
   unsigned expected[]={0,1,2,3,7};assert(!error && selected && command_count==5);
   assert(!memcmp(commands,expected,sizeof expected));
   assert((core_mem[0x78/4]&0x2001)==0x2001);
@@ -81,7 +85,7 @@ static int run(int mode) {
  if(mode==6)assert(error==EIO && command_count==4);
  printf("MODEL CASE %d PASSED, result=%d commands=%d\n",mode,error,command_count);return 0;
 }
-int main(void){for(int i=0;i<=10;i++)run(i);puts("11 production-init model scenarios passed; hardware behavior unverified.");}
+int main(void){for(int i=0;i<=11;i++)run(i);puts("12 production-init model scenarios passed; hardware behavior unverified.");}
 '''
 with tempfile.TemporaryDirectory() as folder:
  p=Path(folder);(p/'model.c').write_text(prefix+s+suffix)

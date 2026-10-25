@@ -1,0 +1,133 @@
+diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
+--- a/bsd/dev/ocean_sdhci.c
++++ b/bsd/dev/ocean_sdhci.c
+@@ -122,6 +122,20 @@
+  * no PMIC, PLL, partition selection, SWITCH, erase or data-write operations.
+  * Motorola QPOS30.52 legacy-MCI controller offsets and DLL bypass sequence.
+  */
++/* Validate runtime translation, including actual stage-1 memory type. */
++static int audit_io(vm_offset_t va, uint64_t expected) {
++    uint64_t par, saved;
++    __asm__ volatile("mrs %1, daif; msr daifset, #15; at s1e1r, %2; isb; "
++        "mrs %0, par_el1; msr daif, %1"
++        : "=&r"(par), "=&r"(saved) : "r"(va) : "memory");
++    printf("OCEAN MAP: expected=%llx PAR=%llx\n", expected, par);
++    if ((par & 1) || (par & 0x0000fffffffff000ULL) != (expected & ~4095ULL) ||
++        ((va ^ expected) & 4095) || (par >> 56) > 0x0c) {
++        printf("OCEAN MAP: wrong physical translation or non-device memory\n");
++        return EFAULT;
++    }
++    return 0;
++}
+ static void delay_us(unsigned int us) {
+     uint64_t start = ticks();
+     while (ticks() - start < (uint64_t)us * 192 / 10) {
+@@ -173,10 +187,20 @@
+     volatile uint32_t *core = (volatile uint32_t *)ml_io_map(0x07824000, 0x800);
+     volatile uint32_t *gcc = (volatile uint32_t *)ml_io_map(0x01800000, 0x80000);
+     if (!core || !gcc) { return ENXIO; }
++    int mapped = audit_io(ocean_regs, 0x07824900);
++    if (!mapped) { mapped = audit_io((vm_offset_t)core, 0x07824000); }
++    if (!mapped) { mapped = audit_io((vm_offset_t)gcc, 0x01800000); }
++    if (mapped) { return mapped; }
++    bool prepared = gcc[0x42008 / 4] == 0x2017 &&
++        (gcc[0x42004 / 4] & 0x80000003U) == 2 &&
++        (gcc[0x4200c / 4] & 255) == 1 &&
++        (gcc[0x42010 / 4] & 255) == 252 &&
++        (gcc[0x42014 / 4] & 255) == 251;
++
+     uint8_t power = r8(0x29);
+     uint32_t pad = r32(0x10c) & 0x18000U;
+     uint32_t apps = gcc[0x42018 / 4], ahb = gcc[0x4201c / 4];
+-    if (gcc[0x42008 / 4] != 0x205) {
++    if (!prepared && gcc[0x42008 / 4] != 0x205) {
+         printf("OCEAN INIT: unrecognized firmware clock source\n");
+         return ENXIO;
+     }
+@@ -227,43 +251,49 @@
+         /* Fixed 1.8V I/O min=max in live FDT; pad/rails retained. */
+         __asm__ volatile("dsb sy" ::: "memory");
+     }
+-    /* Motorola SDHCI_QUIRK2_ALWAYS_USE_BASE_CLOCK: divider must be 0.
+-     * Its exact SDCC1 frequency table uses XO19.2MHz /12 *1/4=400kHz.
+-     * Program only this controller's RCG; never alter shared PLLs. */
+-    w16(0x2c, 0);
+-    /* Force the dedicated RCG on across the dynamic source switch,
+-     * following clock-local2 rcg_set_force_enable/rcg_on_check. Keep on
+-     * for this polling-only driver; ordinary runtime gating is not ported. */
+-    gcc[0x42004 / 4] |= 2;
+-    __asm__ volatile("dsb sy" ::: "memory");
+-    start = ticks();
+-    while (gcc[0x42004 / 4] & 0x80000000U) {
+-        if (ticks() - start > 1920000ULL) {
+-            printf("OCEAN CLOCK: force-root timeout cmd=%x\n", gcc[0x42004 / 4]);
+-            return ETIMEDOUT;
+-        }
+-    }
+-    gcc[0x4200c / 4] = 1;
+-    gcc[0x42010 / 4] = 0xfffffffcU; /* ~(N-M), N=4 M=1. */
+-    gcc[0x42014 / 4] = 0xfffffffbU; /* ~N. */
+-    uint32_t config = (gcc[0x42008 / 4] & ~0x371fU) | 0x2017U;
+-    gcc[0x42008 / 4] = config;
+-    __asm__ volatile("dsb sy" ::: "memory");
+-    gcc[0x42004 / 4] |= 1; /* CMD_RCGR_CONFIG_UPDATE. */
+-    __asm__ volatile("dsb sy" ::: "memory");
+-    start = ticks();
+-    while (gcc[0x42004 / 4] & 0x80000001U) {
+-        if (ticks() - start > 1920000ULL) {
+-            printf("OCEAN CLOCK: RCG update/root timeout cmd=%x\n", gcc[0x42004 / 4]);
+-            return ETIMEDOUT;
+-        }
+-    }
+-    printf("OCEAN CLOCK: XO400k cfg=%x M=%x N=%x D=%x\n",
+-        gcc[0x42008 / 4], gcc[0x4200c / 4], gcc[0x42010 / 4], gcc[0x42014 / 4]);
+-    if (gcc[0x42008 / 4] != config ||
+-        (gcc[0x4200c / 4] & 255) != 1 ||
+-        (gcc[0x42010 / 4] & 255) != 252 ||
+-        (gcc[0x42014 / 4] & 255) != 251) { return EIO; }
++    if (prepared) {
++        printf("OCEAN CLOCK: verified pre-XNU XO400k handoff\n");
++        if ((gcc[0x42004 / 4] & 0x80000003U) != 2 ||
++            gcc[0x42008 / 4] != 0x2017) { return EIO; }
++    } else {
++        /* Motorola SDHCI_QUIRK2_ALWAYS_USE_BASE_CLOCK: divider must be 0.
++         * Its exact SDCC1 frequency table uses XO19.2MHz /12 *1/4=400kHz.
++         * Program only this controller's RCG; never alter shared PLLs. */
++        w16(0x2c, 0);
++        /* Force the dedicated RCG on across the dynamic source switch,
++         * following clock-local2 rcg_set_force_enable/rcg_on_check. Keep on
++         * for this polling-only driver; ordinary runtime gating is not ported. */
++        gcc[0x42004 / 4] |= 2;
++        __asm__ volatile("dsb sy" ::: "memory");
++        start = ticks();
++        while (gcc[0x42004 / 4] & 0x80000000U) {
++            if (ticks() - start > 1920000ULL) {
++                printf("OCEAN CLOCK: force-root timeout cmd=%x\n", gcc[0x42004 / 4]);
++                return ETIMEDOUT;
++            }
++        }
++        gcc[0x4200c / 4] = 1;
++        gcc[0x42010 / 4] = 0xfffffffcU; /* ~(N-M), N=4 M=1. */
++        gcc[0x42014 / 4] = 0xfffffffbU; /* ~N. */
++        uint32_t config = (gcc[0x42008 / 4] & ~0x371fU) | 0x2017U;
++        gcc[0x42008 / 4] = config;
++        __asm__ volatile("dsb sy" ::: "memory");
++        gcc[0x42004 / 4] |= 1; /* CMD_RCGR_CONFIG_UPDATE. */
++        __asm__ volatile("dsb sy" ::: "memory");
++        start = ticks();
++        while (gcc[0x42004 / 4] & 0x80000001U) {
++            if (ticks() - start > 1920000ULL) {
++                printf("OCEAN CLOCK: RCG update/root timeout cmd=%x\n", gcc[0x42004 / 4]);
++                return ETIMEDOUT;
++            }
++        }
++        printf("OCEAN CLOCK: XO400k cfg=%x M=%x N=%x D=%x\n",
++            gcc[0x42008 / 4], gcc[0x4200c / 4], gcc[0x42010 / 4], gcc[0x42014 / 4]);
++        if (gcc[0x42008 / 4] != config ||
++            (gcc[0x4200c / 4] & 255) != 1 ||
++            (gcc[0x42010 / 4] & 255) != 252 ||
++            (gcc[0x42014 / 4] & 255) != 251) { return EIO; }
++    }
+     w16(0x2c, 1); /* Internal clock on, divider bypass. */
+     start = ticks();
+     while (!(r16(0x2c) & 2)) {
