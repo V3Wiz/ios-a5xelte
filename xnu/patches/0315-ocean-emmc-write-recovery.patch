@@ -1,0 +1,184 @@
+diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
+--- a/bsd/dev/ocean_sdhci.c
++++ b/bsd/dev/ocean_sdhci.c
+@@ -60,12 +60,15 @@
+     return ETIMEDOUT;
+ }
+ 
++static uint32_t ocean_last_r1;
++
+ static int command(unsigned int cmd, uint32_t arg, uint8_t *data) {
+-    /* Explicit whitelist: SEND_STATUS, READ_SINGLE_BLOCK and, once enabled,
+-     * WRITE_BLOCK. No CMD25, SWITCH, erase or partition-selection command
+-     * can be issued. */
++    /* Explicit whitelist: SEND_STATUS, STOP_TRANSMISSION (recovery),
++     * READ_SINGLE_BLOCK and, once enabled, WRITE_BLOCK. No CMD25, SWITCH,
++     * erase or partition-selection command can be issued. */
+     bool is_write = cmd == 24;
+-    if (!((cmd == 13 && data == NULL) || (cmd == 17 && data != NULL) ||
++    if (!((cmd == 13 && data == NULL) || (cmd == 12 && data == NULL) ||
++        (cmd == 17 && data != NULL) ||
+         (is_write && data != NULL && ocean_writable))) {
+         return EINVAL;
+     }
+@@ -85,24 +88,14 @@
+     }
+     w32(0x08, arg);
+     __asm__ volatile("dsb sy" ::: "memory");
+-    w16(0x0e, (uint16_t)((cmd << 8) | 0x1aU | (data ? 0x20U : 0)));
+-    int error = wait_status(1);
+-    if (error) { return error; }
+-    uint32_t response = r32(0x10);
+-    w32(0x30, 1);
+-    if (response & 0xfff80000U) {
+-        printf("OCEAN SDHCI: CMD%u R1 error=0x%x\n", cmd, response);
+-        return EIO;
+-    }
+-    if (!data) {
+-        if (!ocean_ready) {
+-            printf("OCEAN SDHCI: CMD13 R1=0x%x state=%u ready=%u\n",
+-                response, (response >> 9) & 15, (response >> 8) & 1);
+-        }
+-        return ((response >> 9) & 15) == 4 && (response & 0x100) ? 0 : EBUSY;
+-    }
++    /* CMD12 is R1b: busy on DAT0 until the card finishes. */
++    w16(0x0e, (uint16_t)((cmd << 8) | (cmd == 12 ? 0x1bU : 0x1aU) | (data ? 0x20U : 0)));
++    int error;
+     if (is_write) {
+-        error = wait_status(0x10); /* Buffer write ready. */
++        /* test20 saw Buffer Write Ready without Command Complete on this
++         * host, so feed the buffer on BWR and check the R1 response once
++         * the transfer completes (which implies the command completed). */
++        error = wait_status(0x10);
+         if (error) { return error; }
+         for (unsigned int i = 0; i < 128; i++) {
+             uint32_t word;
+@@ -110,23 +103,83 @@
+             w32(0x20, word);
+         }
+         w32(0x30, 0x10);
+-    } else {
+-        error = wait_status(0x20);
++        error = wait_status(2);
++        w32(0x30, 3);
+         if (error) { return error; }
+-        for (unsigned int i = 0; i < 128; i++) {
+-            uint32_t word = r32(0x20);
+-            memcpy(data + i * 4, &word, 4);
+-        }
+-        w32(0x30, 0x20);
+-    }
++        uint32_t response = r32(0x10);
++        if (response & 0xfff80000U) {
++            printf("OCEAN SDHCI: CMD24 R1 error=0x%x\n", response);
++            return EIO;
++        }
++        return 0;
++    }
++    error = wait_status(1);
++    if (error) { return error; }
++    uint32_t response = r32(0x10);
++    w32(0x30, 1);
++    ocean_last_r1 = response;
++    if (cmd == 12) {
++        error = wait_status(2);
++        w32(0x30, 2);
++        return error;
++    }
++    if (response & 0xfff80000U) {
++        printf("OCEAN SDHCI: CMD%u R1 error=0x%x\n", cmd, response);
++        return EIO;
++    }
++    if (!data) {
++        if (!ocean_ready) {
++            printf("OCEAN SDHCI: CMD13 R1=0x%x state=%u ready=%u\n",
++                response, (response >> 9) & 15, (response >> 8) & 1);
++        }
++        return ((response >> 9) & 15) == 4 && (response & 0x100) ? 0 : EBUSY;
++    }
++    error = wait_status(0x20);
++    if (error) { return error; }
++    for (unsigned int i = 0; i < 128; i++) {
++        uint32_t word = r32(0x20);
++        memcpy(data + i * 4, &word, 4);
++    }
++    w32(0x30, 0x20);
+     error = wait_status(2);
+     w32(0x30, 2);
+     return error;
+ }
+ 
++/* After a failed command: reset the host CMD/DAT state machines, stop a
++ * card left waiting in data/receive state, then wait for transfer state. */
++static int recover(void) {
++    *(volatile uint8_t *)(ocean_regs + 0x2f) = 0x06; /* RESET_CMD | RESET_DATA. */
++    __asm__ volatile("dsb sy" ::: "memory");
++    uint64_t start = ticks();
++    while (r8(0x2f) & 0x06) {
++        if (ticks() - start > 1920000ULL) { return ETIMEDOUT; }
++    }
++    w32(0x30, 0xffffffffU);
++    start = ticks();
++    int error;
++    while ((error = command(13, 1U << 16, NULL)) != 0) {
++        unsigned int state = (ocean_last_r1 >> 9) & 15;
++        if (error == EBUSY && (state == 5 || state == 6)) {
++            command(12, 0, NULL);
++        }
++        if (ticks() - start >= 19200000ULL * 2) {
++            printf("OCEAN SDHCI: recovery failed (%d) R1=0x%x\n", error, ocean_last_r1);
++            return error;
++        }
++        __asm__ volatile("yield");
++    }
++    return 0;
++}
++
+ static int read_sector(uint64_t lba, uint8_t *data) {
+     if (lba >= ocean_sectors || lba > UINT32_MAX) { return EINVAL; }
+-    return command(17, (uint32_t)lba, data);
++    int error = command(17, (uint32_t)lba, data);
++    if (error && ocean_ready && !recover()) {
++        printf("OCEAN SDHCI: CMD17 lba=%llu failed (%d), retrying\n", lba, error);
++        error = command(17, (uint32_t)lba, data);
++    }
++    return error;
+ }
+ static int write_sector(uint64_t lba, const uint8_t *data) {
+     /* Fence: only the iOS volume inside the verified userdata partition. */
+@@ -137,20 +190,21 @@
+     }
+     uint8_t buffer[512];
+     memcpy(buffer, data, 512);
+-    int error = command(24, (uint32_t)lba, buffer);
+-    if (error) {
+-        printf("OCEAN SDHCI: CMD24 lba=%llu failed (%d)\n", lba, error);
+-        return error;
+-    }
+-    /* Transfer complete covers DAT0 busy; also wait for the card to leave
+-     * the programming state before the next command. */
+-    uint64_t start = ticks();
+-    while ((error = command(13, 1U << 16, NULL)) == EBUSY) {
+-        if (ticks() - start >= 19200000ULL * 2) {
+-            printf("OCEAN SDHCI: programming timeout lba=%llu\n", lba);
+-            return ETIMEDOUT;
+-        }
+-        __asm__ volatile("yield");
++    int error = 0;
++    for (int attempt = 0; attempt < 3; attempt++) {
++        error = command(24, (uint32_t)lba, buffer);
++        if (!error) {
++            /* Transfer complete covers DAT0 busy; also wait for the card to
++             * leave the programming state before the next command. */
++            uint64_t start = ticks();
++            while ((error = command(13, 1U << 16, NULL)) == EBUSY) {
++                if (ticks() - start >= 19200000ULL * 2) { error = ETIMEDOUT; break; }
++                __asm__ volatile("yield");
++            }
++            if (!error) { return 0; }
++        }
++        printf("OCEAN SDHCI: CMD24 lba=%llu attempt %d failed (%d)\n", lba, attempt + 1, error);
++        if (recover()) { break; }
+     }
+     return error;
+ }
