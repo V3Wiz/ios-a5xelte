@@ -1,0 +1,277 @@
+diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
+--- a/bsd/dev/ocean_sdhci.c
++++ b/bsd/dev/ocean_sdhci.c
+@@ -459,6 +459,65 @@
+     return initialize_card();
+ }
+ 
++/* SDCC1 RCG update with the root force-enabled across the switch, as in
++ * the loader's verified XO400k sequence. */
++static int rcg_update(volatile uint32_t *gcc, uint32_t cfg) {
++    gcc[0x42004 / 4] |= 2;
++    __asm__ volatile("dsb sy" ::: "memory");
++    uint64_t start = ticks();
++    while (gcc[0x42004 / 4] & 0x80000000U) {
++        if (ticks() - start > 1920000ULL) { return ETIMEDOUT; }
++    }
++    gcc[0x42008 / 4] = cfg;
++    __asm__ volatile("dsb sy" ::: "memory");
++    gcc[0x42004 / 4] |= 1;
++    __asm__ volatile("dsb sy" ::: "memory");
++    start = ticks();
++    while (gcc[0x42004 / 4] & 0x80000001U) {
++        if (ticks() - start > 1920000ULL) { return ETIMEDOUT; }
++    }
++    return gcc[0x42008 / 4] == cfg ? 0 : EIO;
++}
++static int card_clock(volatile uint32_t *gcc, uint32_t cfg) {
++    w16(0x2c, r16(0x2c) & ~4U); /* Card clock off across the switch. */
++    __asm__ volatile("dsb sy" ::: "memory");
++    int error = rcg_update(gcc, cfg);
++    w16(0x2c, r16(0x2c) | 4U);
++    uint64_t start = ticks();
++    while ((r16(0x2c) & 7) != 7) {
++        if (ticks() - start > 1920000ULL) { return error ? error : ETIMEDOUT; }
++    }
++    delay_us(1000);
++    return error;
++}
++
++/* Boot-arg ocean_fastclk=1: after identification at 400 kHz, run data
++ * transfers from XO directly (19.2 MHz, default-speed timing, still one
++ * bit). The GPT header must read back identically, else revert. */
++static void fast_clock(void) {
++    int optin = 0;
++    PE_parse_boot_argn("ocean_fastclk", &optin, sizeof(optin));
++    if (optin != 1) { return; }
++    volatile uint32_t *gcc = (volatile uint32_t *)ml_io_map(0x01800000, 0x80000);
++    uint8_t before[512], after[512];
++    if (!gcc || read_sector(1, before)) { return; }
++    uint32_t slow = gcc[0x42008 / 4];
++    if ((slow & 0x371fU) != 0x2017U) {
++        printf("OCEAN CLOCK: unexpected cfg=%x, staying at 400k\n", slow);
++        return;
++    }
++    int error = card_clock(gcc, slow & ~0x371fU);
++    if (!error) { error = command(13, 1U << 16, NULL); }
++    if (!error) { error = read_sector(1, after); }
++    if (!error && memcmp(before, after, sizeof(before))) { error = EIO; }
++    if (error) {
++        printf("OCEAN CLOCK: XO 19.2 MHz failed (%d), reverting to 400k\n", error);
++        card_clock(gcc, slow);
++        return;
++    }
++    printf("OCEAN CLOCK: data transfers at XO 19.2 MHz cfg=%x\n", gcc[0x42008 / 4]);
++}
++
+ /* Explicit opt-in selects only the verified userdata geometry. */
+ static bool root_candidate(const char *name, uint64_t first, uint64_t last, int optin) {
+     if (!strcmp(name, "userdata")) {
+@@ -614,6 +673,7 @@
+     if (!ocean_ready) {
+         int error=map_host(); if (error) { return error; }
+         error=find_hfs(); if (error) { return error; }
++        fast_clock();
+         int bmajor=bdevsw_add(-1,&sd_bdevsw); if (bmajor<0) { return ENXIO; }
+         int cmajor=cdevsw_add_with_bdev(-1,&sd_cdevsw,bmajor); if (cmajor<0) { return ENXIO; }
+         int write_optin=0;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -86,6 +86,17 @@
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
++#if defined(ARM64_BOARD_CONFIG_OCEAN)
++/*
++ * The Moto panel (720x1520) is smaller than the iPhone X canvas and packed
++ * BGR888 (3 bytes per pixel), so the canvas is a 32-bit kernel buffer and
++ * oceanScanout() scales it to the panel height: 704x1520, 8 pixels of black
++ * on each side. 704 and the 24-byte margin keep rows 4-byte aligned, so four
++ * pixels pack into three 32-bit stores.
++ */
++#define OCEAN_SCAN_W                    704
++#define OCEAN_SCAN_X                    8
++#endif
+ 
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+@@ -129,6 +140,14 @@
+ #endif
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++#if defined(ARM64_BOARD_CONFIG_OCEAN)
++	IOMemoryMap  *fPanelMap;      /* packed BGR888 panel, write-combined */
++	uintptr_t     fPanel;
++	bool          fPanelCleared;
++	uint16_t      fScanSrcX[OCEAN_SCAN_W];
++
++	void oceanScanout(void);
++#endif
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -171,7 +190,28 @@
+ 		return false;
+ 	}
+ 	PE_current_console(&video);
+-#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#if defined(ARM64_BOARD_CONFIG_OCEAN)
++	(void)video;
++	IOMemoryDescriptor *panel = IOMemoryDescriptor::withPhysicalAddress(A5XELTE_FB_PA,
++	    round_page(A5XELTE_FB_STRIDE * A5XELTE_FB_HEIGHT), kIODirectionInOut);
++	fPanelMap = panel != NULL ? panel->map(kIOMapWriteCombineCache) : NULL;
++	OSSafeReleaseNULL(panel);
++	fPanel = fPanelMap != NULL ? (uintptr_t)fPanelMap->getVirtualAddress() : 0;
++	fPanelCleared = false;
++	for (uint32_t x = 0; x < OCEAN_SCAN_W; x++) {
++		fScanSrcX[x] = (uint16_t)((x * SWEET_FB_LOGICAL_W + SWEET_FB_LOGICAL_W / 2) / OCEAN_SCAN_W);
++	}
++	fWidth = SWEET_FB_LOGICAL_W;
++	fHeight = SWEET_FB_LOGICAL_H;
++	fRowBytes = SWEET_FB_LOGICAL_W * 4;
++	fSurface = fPanel != 0 ? sweet_surface_create_buffer(fWidth, fHeight, fRowBytes,
++	    SWEET_FB_FORMAT_BGRA) : NULL;
++	if (fSurface == NULL) {
++		IOLog("OCEAN FB: panel map or canvas allocation failed\n");
++		return false;
++	}
++	fPhys = A5XELTE_FB_PA;  /* informational; the canvas is not physical */
++#elif defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	/* The loader's DECON handoff scans out this physical XRGB8888 buffer.
+ 	 * It does not fill boot_args.Video, so PE_current_console is empty.
+ 	 * Keep the physical address out of the donor path. */
+@@ -210,7 +250,9 @@
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
++#if !defined(ARM64_BOARD_CONFIG_OCEAN)
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
++#endif
+ 	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+ 	fWorkLoop = IOWorkLoop::workLoop();
+ 	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+@@ -225,7 +267,7 @@
+ 		return false;
+ 	}
+ 	uint32_t hz = 10;
+-#if defined(ARM64_BOARD_CONFIG_A5XELTE)
++#if defined(ARM64_BOARD_CONFIG_A5XELTE) && !defined(ARM64_BOARD_CONFIG_OCEAN)
+ 	/* A5's 1080x1920 panel copies 8.29 MB per full frame. Keep the
+ 	 * donor's 10 Hz default while allowing 30 Hz on this board. */
+ 	hz = 30;
+@@ -297,6 +339,9 @@
+ 					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+ 				}
+ 			}
++#if defined(ARM64_BOARD_CONFIG_OCEAN)
++			fb->oceanScanout();
++#endif
+ 		}
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+@@ -316,6 +361,11 @@
+ 		uint64_t before = fb->fPerfLog ? mach_absolute_time() : 0;
+ #endif
+ 		uint64_t bytes = fb->present(rec);
++#if defined(ARM64_BOARD_CONFIG_OCEAN)
++		/* Also covers clients drawing straight into the default surface,
++		 * which present() skips. */
++		fb->oceanScanout();
++#endif
+ #if defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 		if (fb->fPerfLog) {
+ 			uint64_t ns = 0;
+@@ -521,6 +571,35 @@
+ 	return copied;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_OCEAN)
++void
++AppleCLCD::oceanScanout(void)
++{
++	if (!fPanelCleared) {
++		/* Drop the boot console text once; the margins stay black. */
++		for (uint32_t y = 0; y < A5XELTE_FB_HEIGHT; y++) {
++			bzero((void *)(fPanel + (uint64_t)y * A5XELTE_FB_STRIDE), A5XELTE_FB_WIDTH * 3);
++		}
++		fPanelCleared = true;
++	}
++	for (uint32_t y = 0; y < A5XELTE_FB_HEIGHT; y++) {
++		uint32_t sy = (uint32_t)(((uint64_t)y * fHeight + fHeight / 2) / A5XELTE_FB_HEIGHT);
++		const uint32_t *src = (const uint32_t *)(fPixels + (uint64_t)sy * fRowBytes);
++		volatile uint32_t *dst = (volatile uint32_t *)(fPanel + (uint64_t)y * A5XELTE_FB_STRIDE +
++		    OCEAN_SCAN_X * 3);
++		/* BGRA little-endian words -> packed B,G,R bytes, 4 pixels per 3 words. */
++		for (uint32_t x = 0; x < OCEAN_SCAN_W; x += 4) {
++			uint32_t p0 = src[fScanSrcX[x]], p1 = src[fScanSrcX[x + 1]];
++			uint32_t p2 = src[fScanSrcX[x + 2]], p3 = src[fScanSrcX[x + 3]];
++			*dst++ = (p0 & 0xffffff) | (p1 << 24);
++			*dst++ = ((p1 >> 8) & 0xffff) | (p2 << 16);
++			*dst++ = ((p2 >> 16) & 0xff) | (p3 << 8);
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++#endif
++
+ bool
+ IOMobileFramebufferUserClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+ {
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -247,6 +247,37 @@
+ 	}
+ 	return s;
+ }
++
++#if defined(ARM64_BOARD_CONFIG_OCEAN)
++SweetSurface *
++sweet_surface_create_buffer(uint32_t width, uint32_t height,
++    uint32_t bytesPerRow, uint32_t pixelFormat)
++{
++	SweetSurface *s = sweet_surface_alloc();
++	if (s == NULL) {
++		return NULL;
++	}
++	s->width = width;
++	s->height = height;
++	s->bytesPerRow = bytesPerRow;
++	s->bytesPerElement = 4;
++	s->elementWidth = s->elementHeight = 1;
++	s->pixelFormat = pixelFormat;
++	s->allocSize = (uint32_t)round_page(bytesPerRow * height);
++	IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++	if (mem != NULL) {
++		bzero(mem->getBytesNoCopy(), s->allocSize);
++	}
++	s->memory = mem;
++	s->mapCache = kIOMapDefaultCache;
++	if (s->memory == NULL || !sweet_surface_publish(s)) {
++		s->release();
++		return NULL;
++	}
++	return s;
++}
++#endif
+ 
+ mach_port_name_t
+ sweet_surface_port_in_task(SweetSurface *s, task_t task)
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -58,6 +58,12 @@
+ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
+ 
++#if defined(ARM64_BOARD_CONFIG_OCEAN)
++/* Publish a zeroed, cached kernel buffer as a surface (the Ocean canvas). */
++SweetSurface *sweet_surface_create_buffer(uint32_t width, uint32_t height,
++    uint32_t bytesPerRow, uint32_t pixelFormat);
++#endif
++
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);
+ 
