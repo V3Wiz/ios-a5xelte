@@ -1,0 +1,59 @@
+diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
+--- a/bsd/dev/ocean_sdhci.c
++++ b/bsd/dev/ocean_sdhci.c
+@@ -358,7 +358,34 @@
+     return initialize_card();
+ }
+
++/* Explicit opt-in selects only the verified userdata geometry. */
++static bool root_candidate(const char *name, uint64_t first, uint64_t last, int optin) {
++    if (!strcmp(name, "userdata")) {
++        return optin == 1 && first == 15826944ULL && last == 122142686ULL;
++    }
++    return !strcmp(name, "IOS") || !strcmp(name, "ios") || !strcmp(name, "OCEAN_IOS");
++}
++static uint32_t hfs_be32(const uint8_t *p) {
++    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
++        ((uint32_t)p[2] << 8) | p[3];
++}
++static int root_volume(const uint8_t *v, uint64_t sectors, bool userdata, uint64_t *length) {
++    unsigned int version = ((unsigned int)v[2] << 8) | v[3];
++    if (v[0] != 'H' || !((v[1] == 'X' && version == 5) ||
++        (v[1] == '+' && version == 4))) { return EINVAL; }
++    uint32_t block = hfs_be32(v + 40), count = hfs_be32(v + 44);
++    if (block < 512 || block > 65536 || (block & (block - 1)) ||
++        count < 2 || hfs_be32(v + 48) > count) { return EINVAL; }
++    uint64_t bytes = (uint64_t)block * count;
++    if (bytes / 512 > sectors) { return EINVAL; }
++    if (userdata && (v[1] != 'X' || block != 4096 || count != 5242880)) { return EINVAL; }
++    *length = bytes / 512;
++    return 0;
++}
++
+ static int find_hfs(void) {
++    int userdata_optin = 0;
++    PE_parse_boot_argn("ocean_userdata", &userdata_optin, sizeof(userdata_optin));
+     uint8_t header[512], sector[512];
+     int error = read_sector(0, sector);
+     if (error) { return error; }
+@@ -400,13 +427,16 @@
+         char name[37];
+         for (unsigned int j = 0; j < 36; j++) { name[j] = e[56+j*2] ? (char)e[56+j*2] : 0; }
+         name[36] = 0;
+-        /* Only inspect a deliberately named iOS volume, never Android data. */
+-        if (strcmp(name,"IOS") && strcmp(name,"ios") && strcmp(name,"OCEAN_IOS")) { continue; }
++        if (!root_candidate(name, first, last, userdata_optin)) { continue; }
+         uint8_t volume[512];
+         error = read_sector(first+2,volume);
+         if (error) { return error; }
+-        if (volume[0] != 'H' || (volume[1] != '+' && volume[1] != 'X')) { continue; }
+-        ocean_first = first; ocean_length = last-first+1;
++        uint64_t volume_sectors;
++        if (root_volume(volume, last-first+1, !strcmp(name, "userdata"), &volume_sectors)) {
++            printf("OCEAN ROOT: %s has no approved HFS volume\n", name);
++            continue;
++        }
++        ocean_first = first; ocean_length = volume_sectors;
+         printf("OCEAN SDHCI: HFS volume %s found, read-only\n",name);
+         return 0;
+     }

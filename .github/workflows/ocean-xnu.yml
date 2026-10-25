@@ -104,6 +104,9 @@ jobs:
           test -n "$archive"
           python3 tools/check-ocean-asm.py "$archive"
 
+      - name: Check root selector and filesystem bounds
+        run: python3 tools/test-ocean-root.py
+
       - name: Check production eMMC init with injected register faults
         run: python3 tools/test-ocean-init-model.py
 
