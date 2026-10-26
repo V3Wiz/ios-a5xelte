@@ -1,0 +1,33 @@
+diff --git a/bsd/dev/ocean_gpu.c b/bsd/dev/ocean_gpu.c
+--- a/bsd/dev/ocean_gpu.c
++++ b/bsd/dev/ocean_gpu.c
+@@ -675,7 +675,12 @@
+ #define APM_DLY         0x2acu
+ #define MEMACC_PA       0x0b1d1000u
+ #define VLEVEL_APM      0x9fu           /* 875 mV */
+-#define VLEVEL_TOP      0xc5u           /* 1065 mV */
++#define VLEVEL_TOP      0xc5u           /* 1065 mV, FDT corner-7 ceiling */
++/* TWRP's cpr4 on this phone (speed bin 6, fusing rev 2) runs both clusters
++ * at 1804.8 MHz with open-loop = ceiling = 920 mV (closed loop settles near
++ * 880 mV). Default to that; boot-arg ocean_cpumv overrides within
++ * [875, 1065]. */
++#define CPU_MV_DEFAULT  920
+ #define PLL_L_TOP       94u             /* 94 x 19.2 MHz = 1804.8 MHz */
+ 
+ static uint32_t saw_level(vm_offset_t saw) { return rd(saw, SAW_PMIC_STS) & 0x300ffu; }
+@@ -794,8 +799,13 @@
+         printf("OCEAN CPU: APM -> APCC %s (sts %x)\n", a ? "ok" : "TIMEOUT", rd(apm, APM_STS));
+         if (!a) { return; }
+     }
+-    bool v = saw_set_vdd(saw, VLEVEL_TOP);
+-    printf("OCEAN CPU: rail -> 1065 mV %s (pmic %05x)\n", v ? "ok" : "NOT CONFIRMED", saw_level(saw));
++    int mv = CPU_MV_DEFAULT;
++    PE_parse_boot_argn("ocean_cpumv", &mv, sizeof(mv));
++    mv = mv < 875 ? 875 : (mv > 1065 ? 1065 : mv);
++    uint32_t top = (uint32_t)(mv - 80 + 4) / 5;  /* DIV_ROUND_UP((uV - 80 mV), 5 mV) */
++    bool v = saw_set_vdd(saw, top);
++    printf("OCEAN CPU: rail -> %d mV (vlevel %x) %s (pmic %05x)\n", mv, top, v ? "ok" : "NOT CONFIRMED",
++        saw_level(saw));
+     if (!v) { return; }
+     wr(acc, 0x360, 0);                  /* mem-acc corner 3 */
+     wr(acc, 0x364, 1);
