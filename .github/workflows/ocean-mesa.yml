@@ -13,7 +13,7 @@ on:
       - ".github/workflows/ocean-mesa.yml"
 
 concurrency:
-  group: ocean-mesa-${{ github.ref }}
+  group: ocean-mesa-macos15-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
