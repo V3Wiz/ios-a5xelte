@@ -2,7 +2,8 @@ name: ocean-mesa
 
 # Mesa (freedreno + softpipe, OSMesa) and ocean_gltest for the Moto's iOS
 # userland; see mesa/build-mesa-ios.sh. Separate from ocean-xnu so a Mesa
-# build never cancels a kernel build.
+# build never cancels a kernel build. macos-15: the macos-14 pool kept dropping
+# this job unstarted, and Mesa (unlike the kernel) needs no Xcode 15.
 on:
   workflow_dispatch:
   push:
@@ -17,7 +18,7 @@ concurrency:
 
 jobs:
   mesa:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
