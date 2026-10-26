@@ -1,0 +1,142 @@
+diff --git a/bsd/dev/ocean_gpu.c b/bsd/dev/ocean_gpu.c
+--- a/bsd/dev/ocean_gpu.c
++++ b/bsd/dev/ocean_gpu.c
+@@ -28,6 +28,7 @@
+ #if defined(ARM64_BOARD_CONFIG_OCEAN)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/errno.h>
+ #include <kern/clock.h>
+ #include <kern/sched_prim.h>
+ #include <pexpert/pexpert.h>
+@@ -1247,6 +1248,80 @@
+         (mpidr & 0xff00) ? "Gold" : "Silver");
+ }
+ 
++/*
++ * test36: the SAW had never been used (PMIC_STS 0, VCTL 0): the bootloader
++ * sets pm8953_s5 straight through the PMIC arbiter and leaves the SAW
++ * alone. spm-regulator.c falls back to the same thing when the SPM path
++ * fails (qpnp_smps_write_voltage): VSET (0x41) of the S5 peripheral (sid 1,
++ * 0x2000) over SPMI. PMIC arbiter v2 from the FDT (spmi@200f000: chnls
++ * 0x2400000, obsrvr 0x2c00000, cnfg 0x200a000, qcom,ee 0); written only
++ * when the ownership table gives the channel to this EE.
++ */
++#define SPMI_CORE_PA    0x0200f000u
++#define SPMI_CHNLS_PA   0x02400000u
++#define SPMI_OBS_PA     0x02c00000u
++#define SPMI_CNFG_PA    0x0200a000u
++#define S5_PPID         0x120u          /* sid 1, peripheral 0x20 */
++#define S5_RANGE        0x40u
++#define S5_VSET         0x41u
++
++static vm_offset_t s5_rd, s5_wr;
++
++static int spmi_cmd(vm_offset_t ch, uint32_t cmd) {
++    wr(ch, 0x0, cmd);
++    for (unsigned i = 0; i < 10000; i++) {
++        uint32_t status = rd(ch, 0x8);
++        if (status & 1u) { return (status & 0xeu) ? EIO : 0; }
++        delay(1);
++    }
++    return ETIMEDOUT;
++}
++
++static int s5_read(uint8_t off, uint8_t *v) {
++    int e = spmi_cmd(s5_rd, (1u << 27) | ((uint32_t)off << 4));         /* EXT_READL, 1 byte */
++    if (!e) { *v = (uint8_t)rd(s5_rd, 0x18); }
++    return e;
++}
++
++static int s5_write(uint8_t off, uint8_t v) {
++    wr(s5_wr, 0x10, v);
++    return spmi_cmd(s5_wr, (0u << 27) | ((uint32_t)off << 4));          /* EXT_WRITEL, 1 byte */
++}
++
++/* The S5 channel, if this EE owns it; logs what it finds. */
++static bool s5_open(void) {
++    vm_offset_t core = ml_io_map(SPMI_CORE_PA, 0x1000), cnfg = ml_io_map(SPMI_CNFG_PA, 0x1000);
++    if (!core || !cnfg) { return false; }
++    for (unsigned ch = 0; ch < 512; ch++) {
++        if (((rd(core, 0x800 + 4 * ch) >> 8) & 0xfffu) == S5_PPID) {
++            uint32_t owner = rd(cnfg, 0x700 + 4 * ch) & 7u;
++            s5_rd = ml_io_map(SPMI_OBS_PA + 0x8000 * ch, 0x1000);
++            s5_wr = ml_io_map(SPMI_CHNLS_PA + 0x8000 * ch, 0x1000);
++            printf("OCEAN CPU: S5 SPMI channel %u, owner EE %u\n", ch, owner);
++            return owner == 0 && s5_rd && s5_wr;
++        }
++    }
++    printf("OCEAN CPU: S5 SPMI channel not found\n");
++    return false;
++}
++
++static bool s5_set(uint32_t vlevel) {
++    uint8_t got = 0;
++    if (s5_write(S5_VSET, (uint8_t)vlevel)) { return false; }
++    delay(5000);                        /* slew (~600 uV/us at this STEP_CTRL) + settling */
++    return !s5_read(S5_VSET, &got) && got == vlevel;
++}
++
++static bool rail_set(vm_offset_t saw, bool direct, uint32_t vlevel) {
++    return direct ? s5_set(vlevel) : saw_set_vdd(saw, vlevel);
++}
++
++static uint32_t rail_level(vm_offset_t saw, bool direct) {
++    uint8_t v = 0;
++    if (direct) { return s5_read(S5_VSET, &v) ? 0 : v; }
++    return saw_level(saw) & 0xffu;
++}
++
+ static void cpu_boost_thread(void *arg, __unused wait_result_t wr_result) {
+     int stages = (int)(uintptr_t)arg;
+     vm_offset_t saw = ml_io_map(SAW_PA, 0x1000), apm = ml_io_map(APM_PA, 0x1000);
+@@ -1267,16 +1342,32 @@
+         rd(pll0, 0), rd(pll0, 8), rd(apm, 0x50), rd(apm, 0x54), rd(pll1, 0), rd(pll1, 8),
+         rd(rcg1, 0x50), rd(rcg1, 0x54));
+     cpu_mhz("before boost:");
+-    if (!(id & (1u << 2)) || (lvl & 0x30000u) || (lvl & 0xffu) < 0x80u || (lvl & 0xffu) > VLEVEL_TOP) {
++    /* The SAW drives the rail once something has used it; until then the
++     * PMIC is written directly. */
++    bool direct = (lvl & 0x300ffu) == 0;
++    uint32_t cur = lvl & 0xffu;
++    if (direct) {
++        uint8_t range = 0xff, vset = 0;
++        if (!s5_open() || s5_read(S5_RANGE, &range) || s5_read(S5_VSET, &vset) || range != 0) {
++            printf("OCEAN CPU: S5 not writable or not in range 0 (range %x), boost skipped\n", range);
++            return;
++        }
++        cur = vset;
++        printf("OCEAN CPU: SAW unused; S5 set directly over SPMI, now vset %x (%u mV)\n", vset, 80 + 5 * vset);
++    } else if (!(id & (1u << 2)) || (lvl & 0x30000u)) {
+         printf("OCEAN CPU: unexpected SAW state, boost skipped\n");
+         return;
+     }
++    if (cur < 0x80u || cur > VLEVEL_TOP) {
++        printf("OCEAN CPU: rail level %x out of the expected range, boost skipped\n", cur);
++        return;
++    }
+     pause_s(3);
+ 
+     /* 1. Rail: stop at the APM threshold, arrays to APCC, then the top. */
+-    if ((lvl & 0xffu) < VLEVEL_APM) {
+-        bool v = saw_set_vdd(saw, VLEVEL_APM);
+-        printf("OCEAN CPU: rail -> 875 mV %s (pmic %05x)\n", v ? "ok" : "NOT CONFIRMED", saw_level(saw));
++    if (cur < VLEVEL_APM) {
++        bool v = rail_set(saw, direct, VLEVEL_APM);
++        printf("OCEAN CPU: rail -> 875 mV %s (level %x)\n", v ? "ok" : "NOT CONFIRMED", rail_level(saw, direct));
+         if (!v) { return; }
+     }
+     if ((rd(apm, APM_STS) & 0x1fu) != 3) {
+@@ -1288,9 +1379,9 @@
+     PE_parse_boot_argn("ocean_cpumv", &mv, sizeof(mv));
+     mv = mv < 875 ? 875 : (mv > 1065 ? 1065 : mv);
+     uint32_t top = (uint32_t)(mv - 80 + 4) / 5;  /* DIV_ROUND_UP((uV - 80 mV), 5 mV) */
+-    bool v = saw_set_vdd(saw, top);
+-    printf("OCEAN CPU: rail -> %d mV (vlevel %x) %s (pmic %05x)\n", mv, top, v ? "ok" : "NOT CONFIRMED",
+-        saw_level(saw));
++    bool v = rail_set(saw, direct, top);
++    printf("OCEAN CPU: rail -> %d mV (vlevel %x) %s (level %x)\n", mv, top, v ? "ok" : "NOT CONFIRMED",
++        rail_level(saw, direct));
+     if (!v) { return; }
+     wr(acc, 0x360, 0);                  /* mem-acc corner 3 */
+     wr(acc, 0x364, 1);
