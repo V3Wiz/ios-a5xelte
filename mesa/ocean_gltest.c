@@ -7,18 +7,56 @@
  * function pipeline (Mesa turns it into shaders for ir3), reads the pixels
  * back and prints the renderer, a few pixels, a checksum and how long 100
  * frames took. Writes the picture to /tmp/ocean_gltest.ppm.
+ *
+ * Every line also goes to the kernel log through the OceanGPU service's
+ * request 0x7d, so it reaches the persistent log: on the phone this runs
+ * as /usr/sbin/bluetoothd (user mobile, no console) for the first test.
+ * It exits 0, so launchd does not start it again.
  */
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <GL/gl.h>
 #include <GL/osmesa.h>
+#include <IOKit/IOKitLib.h>
 
 #define W 256
 #define H 256
+
+static io_connect_t logger;
+
+static void
+say(const char *format, ...)
+{
+	char line[240] = "ocean_gltest: ";
+	va_list ap;
+
+	va_start(ap, format);
+	vsnprintf(line + strlen(line), sizeof(line) - strlen(line), format, ap);
+	va_end(ap);
+	puts(line);
+	if (logger != 0) {
+		IOConnectCallStructMethod(logger, 0x7d, line, sizeof(line), NULL, NULL);
+	}
+}
+
+static void
+logger_open(void)
+{
+	io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("OceanGPU"));
+
+	if (service != 0) {
+		if (IOServiceOpen(service, mach_task_self(), 0, &logger) != KERN_SUCCESS) {
+			logger = 0;
+		}
+		IOObjectRelease(service);
+	}
+}
 
 static double
 now(void)
@@ -49,19 +87,21 @@ frame(void)
 int
 main(void)
 {
+	logger_open();
+	say("starting (pid %d)", getpid());
 	uint8_t *pixels = calloc(W * H, 4);
 	OSMesaContext ctx = OSMesaCreateContextExt(OSMESA_RGBA, 24, 8, 0, NULL);
 
 	if (pixels == NULL || ctx == NULL) {
-		printf("ocean_gltest: no OSMesa context\n");
+		say("no OSMesa context");
 		return 1;
 	}
 	if (!OSMesaMakeCurrent(ctx, pixels, GL_UNSIGNED_BYTE, W, H)) {
-		printf("ocean_gltest: OSMesaMakeCurrent failed\n");
+		say("OSMesaMakeCurrent failed");
 		return 1;
 	}
-	printf("ocean_gltest: GL_RENDERER %s\n", (const char *)glGetString(GL_RENDERER));
-	printf("ocean_gltest: GL_VERSION %s\n", (const char *)glGetString(GL_VERSION));
+	say("GL_RENDERER %s", (const char *)glGetString(GL_RENDERER));
+	say("GL_VERSION %s", (const char *)glGetString(GL_VERSION));
 
 	frame();
 	uint32_t sum = 0;
@@ -72,15 +112,15 @@ main(void)
 	const int at[4][2] = { { 2, 2 }, { 128, 40 }, { 60, 30 }, { 128, 200 } };
 	for (int i = 0; i < 4; i++) {
 		const uint8_t *p = pixels + 4 * (at[i][1] * W + at[i][0]);
-		printf("ocean_gltest: pixel (%d,%d) = %02x %02x %02x %02x\n", at[i][0], at[i][1], p[0], p[1], p[2], p[3]);
+		say("pixel (%d,%d) = %02x %02x %02x %02x", at[i][0], at[i][1], p[0], p[1], p[2], p[3]);
 	}
-	printf("ocean_gltest: checksum %08x, GL error %#x\n", sum, glGetError());
+	say("checksum %08x, GL error %#x", sum, glGetError());
 
 	double began = now();
 	for (int i = 0; i < 100; i++) {
 		frame();
 	}
-	printf("ocean_gltest: 100 frames of %dx%d in %.1f ms\n", W, H, (now() - began) * 1000);
+	say("100 frames of %dx%d in %.1f ms", W, H, (now() - began) * 1000);
 
 	FILE *f = fopen("/tmp/ocean_gltest.ppm", "wb");
 	if (f != NULL) {
@@ -93,5 +133,6 @@ main(void)
 		fclose(f);
 	}
 	OSMesaDestroyContext(ctx);
+	say("done");
 	return 0;
 }

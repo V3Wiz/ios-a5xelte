@@ -17,6 +17,11 @@ SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 CC=$(xcrun --sdk iphoneos -f clang)
 mkdir -p "$B" "$OUT"
 cd "$B"
+# The iPhoneOS SDK has IOKit to link against but not its headers (HakiOS's SDK
+# does): take them from the macOS SDK; the functions are the same.
+rm -rf iokit-inc && mkdir -p iokit-inc/IOKit
+cp -R "$(xcrun --sdk macosx --show-sdk-path)/System/Library/Frameworks/IOKit.framework/Headers/" iokit-inc/IOKit/
+INC="-I$B/iokit-inc"
 
 curl -sL --fail -o mesa-$VERSION.tar.xz https://archive.mesa3d.org/mesa-$VERSION.tar.xz
 echo "$SHA256  mesa-$VERSION.tar.xz" | shasum -a 256 -c -
@@ -42,9 +47,9 @@ export PATH=$B/venv/bin:/opt/homebrew/opt/bison/bin:/opt/homebrew/opt/flex/bin:$
 
 cat > cross.ini <<INI
 [binaries]
-c = ['$CC', '-arch', 'arm64', '-isysroot', '$SDK', '-miphoneos-version-min=16.0']
-cpp = ['$CC++', '-arch', 'arm64', '-isysroot', '$SDK', '-miphoneos-version-min=16.0']
-objc = ['$CC', '-arch', 'arm64', '-isysroot', '$SDK', '-miphoneos-version-min=16.0']
+c = ['$CC', '-arch', 'arm64', '-isysroot', '$SDK', '-miphoneos-version-min=16.0', '$INC']
+cpp = ['$CC++', '-arch', 'arm64', '-isysroot', '$SDK', '-miphoneos-version-min=16.0', '$INC']
+objc = ['$CC', '-arch', 'arm64', '-isysroot', '$SDK', '-miphoneos-version-min=16.0', '$INC']
 ar = 'ar'
 strip = 'strip'
 pkg-config = 'false'
@@ -60,7 +65,7 @@ endian = 'little'
 needs_exe_wrapper = true
 INI
 meson setup build mesa-$VERSION --cross-file cross.ini --wrap-mode=nofallback \
-	--prefix=/usr/local --libdir=lib --buildtype=release -Db_ndebug=true \
+	--prefix=/usr --libdir=lib --buildtype=release -Db_ndebug=true \
 	-Dplatforms= -Dgallium-drivers=softpipe,freedreno -Dfreedreno-kmds=msm -Dvulkan-drivers= -Dglx=disabled \
 	-Degl=disabled -Dgbm=disabled -Dosmesa=true -Dllvm=disabled -Dshared-glapi=enabled -Dgles1=disabled \
 	-Dgles2=enabled -Dopengl=true -Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled -Dshader-cache=disabled \
@@ -69,9 +74,9 @@ meson setup build mesa-$VERSION --cross-file cross.ini --wrap-mode=nofallback \
 ninja -C build
 
 cp build/src/gallium/targets/osmesa/libOSMesa.8.dylib "$OUT/"
-install_name_tool -id /usr/local/lib/libOSMesa.8.dylib "$OUT/libOSMesa.8.dylib"
-"$CC" -arch arm64 -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 -I mesa-$VERSION/include \
-	-o "$OUT/ocean_gltest" "$HERE/ocean_gltest.c" "$OUT/libOSMesa.8.dylib"
+install_name_tool -id /usr/lib/libOSMesa.8.dylib "$OUT/libOSMesa.8.dylib"
+"$CC" -arch arm64 -isysroot "$SDK" -miphoneos-version-min=16.0 -O2 -I mesa-$VERSION/include $INC \
+	-o "$OUT/ocean_gltest" "$HERE/ocean_gltest.c" "$OUT/libOSMesa.8.dylib" -framework IOKit -framework CoreFoundation
 codesign -s - --force "$OUT/libOSMesa.8.dylib" "$OUT/ocean_gltest"
 otool -L "$OUT/ocean_gltest"
 ls -l "$OUT"
