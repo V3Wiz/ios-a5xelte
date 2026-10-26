@@ -1,0 +1,101 @@
+diff --git a/bsd/dev/ocean_gpu.c b/bsd/dev/ocean_gpu.c
+--- a/bsd/dev/ocean_gpu.c
++++ b/bsd/dev/ocean_gpu.c
+@@ -87,6 +87,9 @@
+ #define R_CP_ADDR_MODE_CNTL     0x0860
+ #define R_CP_INTERRUPT_STATUS   0x0b18
+ #define R_CP_HW_FAULT           0x0b1a
++#define R_CP_PROTECT_STATUS     0x0b1c
++#define R_RBBM_INT_CLEAR_CMD    0x0037
++#define R_RBBM_AHB_ERROR_STATUS 0x04f4
+ #define R_RBBM_AHB_CNTL0        0x0093
+ #define R_RBBM_AHB_CNTL1        0x0094
+ #define R_RBBM_AHB_CNTL2        0x0095
+@@ -881,6 +884,29 @@
+         rd(cb, CB_FSR), rd(cb, CB_FAR + 4), rd(cb, CB_FAR), rd(cb, CB_FSYNR0));
+ }
+ 
++/* What the GPU and its SMMU flagged since the last look; the service calls
++ * it after each submission and CPU wait. Faulting transactions terminate
++ * without a stall (CB0 SCTLR), so a dropped write shows only here. The
++ * first three looks are logged whatever they find, then the first 24 that
++ * find a fault; the SMMU fault and the RBBM interrupts are cleared. */
++void ocean_gpu_check(const char *when);
++void ocean_gpu_check(const char *when) {
++    static unsigned looks, faults;
++    vm_offset_t cb = keep.smmu + SMMU_CB0;
++    uint32_t fsr = rd(cb, CB_FSR), irq = gr(keep.gpu, R_RBBM_INT_0_STATUS);
++    uint32_t hw = gr(keep.gpu, R_CP_HW_FAULT), prot = gr(keep.gpu, R_CP_PROTECT_STATUS);
++    uint32_t ahb = gr(keep.gpu, R_RBBM_AHB_ERROR_STATUS);
++    bool fault = fsr || hw || prot || ahb;
++    if (looks++ < 3 || (fault && faults++ < 24)) {
++        printf("OCEAN GPU: check %s: INT_0 %08x HW_FAULT %08x PROTECT %08x AHB_ERR %08x RBBM_STATUS %08x "
++            "SMMU FSR %08x FAR %08x%08x FSYNR0 %08x fence %u done %u RPTR %u WPTR %u\n", when, irq, hw, prot,
++            ahb, gr(keep.gpu, R_RBBM_STATUS), fsr, rd(cb, CB_FAR + 4), rd(cb, CB_FAR), rd(cb, CB_FSYNR0),
++            keep.fence, fence_done(), gr(keep.gpu, R_CP_RB_RPTR), keep.ring_at);
++    }
++    if (fsr) { wr(cb, CB_FSR, fsr); }
++    if (irq) { gw(keep.gpu, R_RBBM_INT_CLEAR_CMD, irq); }
++}
++
+ static bool wait_fence(uint32_t fence, unsigned ms) {
+     for (unsigned i = 0; i < ms * 10; i++) {
+         if (ocean_gpu_done(fence)) { return true; }
+diff --git a/iokit/Kernel/arm/OceanGPU.cpp b/iokit/Kernel/arm/OceanGPU.cpp
+--- a/iokit/Kernel/arm/OceanGPU.cpp
++++ b/iokit/Kernel/arm/OceanGPU.cpp
+@@ -71,6 +71,7 @@
+ bool ocean_gpu_done(uint32_t fence);
+ uint32_t ocean_gpu_last(void);
+ void ocean_gpu_report(const char *why);
++void ocean_gpu_check(const char *when);
+ 
+ void OceanGPUStart(void);
+ }
+@@ -283,6 +284,7 @@
+ 	uint64_t                fBufferBytes;
+ 	uint32_t                fSubmits;
+ 	uint32_t                fStrangers;
++	uint32_t                fNewLogged;
+ 	struct gpu_left         fLeft[GPU_LEFT];
+ 	uint32_t                fLeftCount;
+ 
+@@ -466,6 +468,12 @@
+ 	b->fence = 0;
+ 	fBufferCount++;
+ 	fBufferBytes += size;
++	if (fNewLogged++ < 48) {
++		addr64_t first = memory->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
++
++		IOLog("OceanGPU: buffer %u: %llu bytes at GPU %#llx (first page %#llx), flags %#x\n", request->handle,
++		    size, b->address, (uint64_t)first, request->flags);
++	}
+ 	IOLockUnlock(gGPULock);
+ 	return kIOReturnSuccess;
+ }
+@@ -547,6 +555,7 @@
+ 		}
+ 	}
+ 	reap();
++	ocean_gpu_check("submit");
+ 	if (request->fence == 0 && !gGPUReported) {
+ 		gGPUReported = true;
+ 		ocean_gpu_report("the ring is full");
+@@ -580,6 +589,9 @@
+ 		*memory = b->memory;
+ 		*options = 0;
+ 		ret = kIOReturnSuccess;
++		if (fNewLogged++ < 48) {
++			IOLog("OceanGPU: buffer %u mapped for the program (%llu bytes)\n", type, b->size);
++		}
+ 	}
+ 	IOLockUnlock(gGPULock);
+ 	return ret;
+@@ -639,6 +651,7 @@
+ 		if (!gpuWait(ocean_gpu_last(), patience)) {
+ 			ret = kIOReturnBusy;
+ 		}
++		ocean_gpu_check("cpu prep");
+ 		IOLockUnlock(gGPULock);
+ 		break;
+ 	case kMsmGemSubmit:
