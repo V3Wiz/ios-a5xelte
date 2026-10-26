@@ -1,0 +1,181 @@
+diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
+--- a/bsd/dev/ocean_sdhci.c
++++ b/bsd/dev/ocean_sdhci.c
+@@ -77,9 +77,11 @@
+      * READ_SINGLE_BLOCK and, once enabled, WRITE_BLOCK. No CMD25, SWITCH,
+      * erase or partition-selection command can be issued. */
+     bool is_write = cmd == 24;
+-    /* CMD6 SWITCH: only EXT_CSD[183] BUS_WIDTH = 4-bit or back to 1-bit. */
++    /* CMD6 SWITCH: only EXT_CSD[183] BUS_WIDTH = 1, 4 or 8-bit (0, 1, 2)
++     * and EXT_CSD[185] HS_TIMING = legacy or high speed (0, 1). */
+     bool bus_switch = cmd == 6 && data == NULL &&
+-        (arg == 0x03b70100U || arg == 0x03b70000U);
++        (arg == 0x03b70100U || arg == 0x03b70000U || arg == 0x03b70200U ||
++        arg == 0x03b90100U || arg == 0x03b90000U);
+     if (!((cmd == 13 && data == NULL) || (cmd == 12 && data == NULL) || bus_switch ||
+         (cmd == 17 && data != NULL) ||
+         (is_write && data != NULL && ocean_writable))) {
+@@ -603,6 +605,76 @@
+     printf("OCEAN SDHCI: 4-bit data bus\n");
+ }
+ 
++static int same_sectors(const uint8_t *want) {
++    static uint8_t got[4 * 512];
++    for (unsigned int i = 0; i < 4; i++) {
++        int error = read_sector(i, got + i * 512);
++        if (error) { return error; }
++    }
++    return memcmp(want, got, sizeof(got)) ? EIO : 0;
++}
++
++/* Boot-arg ocean_hs=1 (after ocean_fastclk=1 and ocean_4bit=1): eMMC
++ * high-speed timing (EXT_CSD[185] HS_TIMING = 1, host High Speed Enable)
++ * at 50 MHz, the msm8953 GCC table's GPLL0 / 16 entry (RCG source 1, divider
++ * field 31; GPLL0 must be locked and voted), then the 8-bit bus (EXT_CSD[183]
++ * = 2, host 8-bit width). Below 100 MHz sdhci-msm needs no tuning or DLL.
++ * Sectors 0..3 must read back identically after each step, else it is
++ * undone: 8-bit falls back to 4-bit, the clock to XO 19.2 MHz. */
++static void high_speed(void) {
++    int optin = 0;
++    PE_parse_boot_argn("ocean_hs", &optin, sizeof(optin));
++    if (optin != 1) { return; }
++    volatile uint32_t *gcc = (volatile uint32_t *)ml_io_map(0x01800000, 0x80000);
++    static uint8_t want[4 * 512];
++    if (!gcc || (r8(0x28) & 0x22) != 0x02) { return; }
++    for (unsigned int i = 0; i < 4; i++) {
++        if (read_sector(i, want + i * 512)) { return; }
++    }
++    uint32_t xo = gcc[0x42008 / 4];
++    if ((xo & 0x371fU) || !(gcc[0x21000 / 4] & 0x80000000U) || !(gcc[0x45000 / 4] & 1U)) {
++        printf("OCEAN CLOCK: cfg=%x gpll0 mode=%x vote=%x, staying at 19.2 MHz\n",
++            xo, gcc[0x21000 / 4], gcc[0x45000 / 4]);
++        return;
++    }
++    int error = command(6, 0x03b90100U, NULL);
++    if (!error) { error = wait_transfer_state(); }
++    if (!error && (ocean_last_r1 & 0x80)) { error = EIO; } /* SWITCH_ERROR */
++    if (!error) {
++        w8(0x28, r8(0x28) | 0x04); /* Host high-speed enable. */
++        error = card_clock(gcc, (xo & ~0x71fU) | 0x11fU);
++    }
++    if (!error) { error = wait_transfer_state(); }
++    if (!error) { error = same_sectors(want); }
++    if (error) {
++        printf("OCEAN CLOCK: 50 MHz high speed failed (%d) R1=0x%x, back to 19.2 MHz\n",
++            error, ocean_last_r1);
++        card_clock(gcc, xo);
++        w8(0x28, r8(0x28) & ~0x04);
++        recover();
++        command(6, 0x03b90000U, NULL);
++        wait_transfer_state();
++        return;
++    }
++    printf("OCEAN CLOCK: data transfers at 50 MHz high speed cfg=%x\n", gcc[0x42008 / 4]);
++    error = command(6, 0x03b70200U, NULL);
++    if (!error) { error = wait_transfer_state(); }
++    if (!error && (ocean_last_r1 & 0x80)) { error = EIO; }
++    if (!error) {
++        w8(0x28, (r8(0x28) & ~0x02) | 0x20); /* Host 8-bit data width. */
++        error = same_sectors(want);
++    }
++    if (error) {
++        printf("OCEAN SDHCI: 8-bit bus failed (%d) R1=0x%x, back to 4-bit\n", error, ocean_last_r1);
++        w8(0x28, (r8(0x28) & ~0x20) | 0x02);
++        recover();
++        command(6, 0x03b70100U, NULL);
++        wait_transfer_state();
++        return;
++    }
++    printf("OCEAN SDHCI: 8-bit data bus\n");
++}
++
+ /* test24: during CMD18 Present State showed Buffer Read Enable (0x800)
+  * while Normal Interrupt Status stayed 0, so also accept the present bit. */
+ static int wait_read_buffer(void) {
+@@ -1107,6 +1179,7 @@
+         cpu_speed();
+         fast_clock();
+         bus_width_4();
++        high_speed();
+         multiblock_enable();
+         int bmajor=bdevsw_add(-1,&sd_bdevsw); if (bmajor<0) { return ENXIO; }
+         int cmajor=cdevsw_add_with_bdev(-1,&sd_cdevsw,bmajor); if (cmajor<0) { return ENXIO; }
+diff --git a/bsd/dev/ocean_gpu.c b/bsd/dev/ocean_gpu.c
+--- a/bsd/dev/ocean_gpu.c
++++ b/bsd/dev/ocean_gpu.c
+@@ -1134,7 +1134,8 @@
+  * CPU boost to the SDM632 top corner, boot-arg ocean_cpumax=N (stages):
+  * 1 = rail to the corner-7 ceiling with the APM and mem-acc changes it needs,
+  * 2 = also Gold (perfcl) PLL at 1804.8 MHz, 3 = also the boot cluster
+- * (pwrcl). All values from the stock FDT and Motorola's drivers:
++ * (pwrcl), 4 = also the CCI at 787.2 MHz. All values from the stock FDT and
++ * Motorola's drivers:
+  *   - Rail pm8953_s5 (FTS2.5, range 0: vlevel = (uV - 80 mV) / 5 mV) is set
+  *     through the CCI SAW (spm-v2 at 0xb1d2000, SAW v4.1 offsets): msm-spm.c
+  *     msm_spm_drv_set_vdd. Both clusters share it; cpr4 ceilings per corner
+@@ -1230,6 +1231,41 @@
+     return ok;
+ }
+ 
++/*
++ * CCI PLL 0xb1d0000, a slewing alpha PLL (clock-cpu-sdm632.c apcs_cci_pll,
++ * clock-alpha-pll.c __init_alpha_pll + dyna_alpha_pll_enable): config ctl,
++ * early output, latch interface off; lock at the VCO midpoint 750 MHz (L 39
++ * + alpha 1/16, vco 2, alpha enable), slew to 787.2 MHz with a dynamic
++ * update (MODE bit 22), then the output. Left alone if already running.
++ */
++#define CCI_PLL_PA      0x0b1d0000u
++#define CCI_PLL_L       41u             /* 41 x 19.2 MHz = 787.2 MHz */
++
++static bool cci_pll_start(vm_offset_t pll) {
++    if (rd(pll, 0x00) & 0x7u) { return false; }
++    wr(pll, 0x18, 0x4001055b);
++    wr(pll, 0x10, (rd(pll, 0x10) & ~0xfu) | 0x8u);
++    wr(pll, 0x14, rd(pll, 0x14) & ~(1u << 11));
++    wr(pll, 0x04, 39);
++    wr(pll, 0x08, 0);                           /* alpha 0x10000000 << 8, low word */
++    wr(pll, 0x0c, 0x10);
++    wr(pll, 0x10, (rd(pll, 0x10) & ~(3u << 20)) | (2u << 20) | (1u << 24));
++    uint32_t mode = rd(pll, 0x00) | (1u << 1);  /* BYPASSNL */
++    wr(pll, 0x00, mode);
++    delay(5);
++    wr(pll, 0x00, mode | (1u << 2));            /* RESET_N */
++    if (!poll(pll, 0x00, 1u << 31, 1u << 31, 2)) { return false; }
++    wr(pll, 0x04, CCI_PLL_L);
++    wr(pll, 0x08, 0);
++    wr(pll, 0x0c, 0);
++    wr(pll, 0x00, rd(pll, 0x00) | (1u << 22));
++    if (!poll(pll, 0x00, 1u << 22, 0, 2)) { return false; }
++    delay(1);
++    if (!poll(pll, 0x00, 1u << 31, 1u << 31, 2)) { return false; }
++    wr(pll, 0x00, rd(pll, 0x00) | 1u);          /* OUTCTRL */
++    return true;
++}
++
+ static uint64_t cntpct(void) {
+     uint64_t n;
+     __asm__ volatile("isb\n\tmrs %0, cntpct_el0" : "=r"(n));
+@@ -1414,6 +1450,23 @@
+     cpu_mhz("after Silver:");
+     pause_s(2);
+     cpu_mhz("check:");
++    if (stages < 4) { return; }
++
++    /* 4. CCI (L2 coherency and the CPUs' path to DDR): the bootloader leaves
++     * its mux (0xb1d1050, in the mem-acc page) on GPLL0 / 2 = 400 MHz; Linux
++     * runs it from its own PLL at 787.2 MHz, the top corner of this rail. */
++    vm_offset_t cci = ml_io_map(CCI_PLL_PA, 0x1000);
++    if (!cci) { return; }
++    pause_s(2);
++    lock = cci_pll_start(cci);
++    printf("OCEAN CPU: cci pll %s mode %08x l %x user %08x\n", lock ? "locked" : "NOT STARTED",
++        rd(cci, 0), rd(cci, 4), rd(cci, 0x10));
++    if (!lock) { return; }
++    wr(acc, 0x54, (rd(acc, 0x54) & ~0x71fu) | (5u << 8) | 1u);
++    wr(acc, 0x50, rd(acc, 0x50) | 1u);
++    m = poll(acc, 0x50, 1u, 0, 10);
++    printf("OCEAN CPU: CCI mux %s cmd %08x cfg %08x -> 787.2 MHz\n", m ? "switched" : "update TIMEOUT",
++        rd(acc, 0x50), rd(acc, 0x54));
+ }
+ 
+ void ocean_cpu_boost_start(void);
