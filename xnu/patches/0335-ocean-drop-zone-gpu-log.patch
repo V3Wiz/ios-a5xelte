@@ -1,0 +1,216 @@
+diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
+--- a/bsd/dev/ocean_sdhci.c
++++ b/bsd/dev/ocean_sdhci.c
+@@ -935,6 +935,170 @@
+     }
+ }
+ 
++/*
++ * Drop zone (tools/ocean-drop.py): files from the PC into the iOS root. 256
++ * MiB of userdata after the 20 GiB HFSX volume (which ends at sector
++ * 57769983) and far before the log area, outside every filesystem; the PC
++ * writes it from TWRP. Sector 0:
++ *   "OCEANDP1" | u32 version 1 | u32 count | u64 data bytes |
++ *   u32 crc32 (entry sectors + data) | u32 state (0 new, 1 done)
++ * then one 512-byte entry per file (char path[256] | u32 mode | u32 pad |
++ * u64 offset into the data | u64 size), then the data, each file starting
++ * on a sector. Once the root is mounted the CRC is checked over everything
++ * first; then every file is written through the VFS (absolute paths whose
++ * directory exists) and, if all were, state 1 is written to sector 0, the
++ * only sector here the kernel ever writes. oceandrop=0 disables it.
++ */
++#include <sys/vnode.h>
++#include <sys/fcntl.h>
++#include <sys/kauth.h>
++extern vnode_t rootvnode;
++
++#define OCEAN_DROP_FIRST   58720256ULL          /* 28 GiB into the disk */
++#define OCEAN_DROP_SECTORS (256u << 11)         /* 256 MiB */
++#define OCEAN_DROP_MAX     64u                  /* files */
++#define OCEAN_DROP_CHUNK   128u                 /* sectors per read */
++
++struct ocean_drop_header {
++    char magic[8];
++    uint32_t version, count;
++    uint64_t bytes;
++    uint32_t crc, state;
++};
++struct ocean_drop_entry {
++    char path[256];
++    uint32_t mode, pad;
++    uint64_t offset, size;
++};
++static uint8_t ocean_drop_buf[OCEAN_DROP_CHUNK * 512];
++
++static int drop_read(uint64_t lba, uint32_t n, uint8_t *data) {
++    int error = 0;
++    lck_mtx_lock(&ocean_sd_lock);
++    while (n && !error) {
++        uint32_t k = ocean_multiblock ? MIN(n, (uint32_t)OCEAN_MULTI_MAX) : 1;
++        error = k >= 2 ? read_blocks(lba, k, data) : read_sector(lba, data);
++        lba += k; n -= k; data += (size_t)k * 512u;
++    }
++    lck_mtx_unlock(&ocean_sd_lock);
++    return error;
++}
++
++static int drop_write_header(const uint8_t *sector) {
++    /* Fence: sector 0 of the drop zone only, outside the HFS volume and the log. */
++    if (!ocean_writable || OCEAN_DROP_FIRST < ocean_first + ocean_length ||
++        OCEAN_DROP_FIRST + OCEAN_DROP_SECTORS > OCEAN_LOG_FIRST) {
++        return EROFS;
++    }
++    lck_mtx_lock(&ocean_sd_lock);
++    int error = program_sector(OCEAN_DROP_FIRST, sector);
++    lck_mtx_unlock(&ocean_sd_lock);
++    return error;
++}
++
++static int drop_file(const struct ocean_drop_entry *e, uint64_t data_lba) {
++    vfs_context_t ctx = vfs_context_kernel();
++    vnode_t vp = NULLVP;
++    int error = 0;
++    for (int tries = 0; tries < 10; tries++) {
++        error = vnode_open(e->path, FWRITE | O_CREAT | O_TRUNC, (int)(e->mode & 07777), 0, &vp, ctx);
++        if (error != ETXTBSY && error != EBUSY) { break; }
++        (void)tsleep(&ocean_drop_buf, PZERO, "oceandrop", hz * 3);   /* launchd restarting it */
++    }
++    if (error) { return error; }
++    uint64_t done = 0, lba = data_lba + e->offset / 512u;
++    while (done < e->size && !error) {
++        uint32_t n = (uint32_t)MIN((e->size - done + 511u) / 512u, (uint64_t)OCEAN_DROP_CHUNK);
++        int len = (int)MIN(e->size - done, (uint64_t)n * 512u), resid = 0;
++        error = drop_read(lba, n, ocean_drop_buf);
++        if (!error) {
++            error = vn_rdwr(UIO_WRITE, vp, (caddr_t)ocean_drop_buf, len, (off_t)done, UIO_SYSSPACE,
++                IO_UNIT, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++            if (!error && resid) { error = EIO; }
++        }
++        done += (uint64_t)len;
++        lba += n;
++    }
++    int cerror = vnode_close(vp, FWRITE, ctx);
++    return error ? error : cerror;
++}
++
++static void drop_thread(__unused void *arg, __unused wait_result_t wr) {
++    static struct ocean_drop_entry entries[OCEAN_DROP_MAX];
++    uint8_t sector[512];
++    while (rootvnode == NULLVP) {
++        (void)tsleep(&ocean_drop_buf, PZERO, "oceandrop", hz / 10);
++    }
++    (void)tsleep(&ocean_drop_buf, PZERO, "oceandrop", hz);
++    if (drop_read(OCEAN_DROP_FIRST, 1, sector)) {
++        printf("OCEAN DROP: header read failed\n");
++        return;
++    }
++    struct ocean_drop_header h;
++    memcpy(&h, sector, sizeof(h));
++    if (memcmp(h.magic, "OCEANDP1", 8) != 0) {
++        return;                                     /* nothing dropped */
++    }
++    if (h.state != 0) {
++        printf("OCEAN DROP: %u files, already unpacked\n", h.count);
++        return;
++    }
++    uint64_t data_lba = OCEAN_DROP_FIRST + 1u + h.count;
++    if (h.version != 1 || h.count == 0 || h.count > OCEAN_DROP_MAX ||
++        data_lba + (h.bytes + 511u) / 512u > OCEAN_DROP_FIRST + OCEAN_DROP_SECTORS) {
++        printf("OCEAN DROP: bad header (version %u, %u files, %llu bytes)\n", h.version, h.count, h.bytes);
++        return;
++    }
++    /* Entries, then the CRC over entries and data, before anything is written. */
++    uint32_t crc = 0xffffffffU;
++    for (uint32_t i = 0; i < h.count; i++) {
++        if (drop_read(OCEAN_DROP_FIRST + 1u + i, 1, sector)) { printf("OCEAN DROP: entry read failed\n"); return; }
++        crc = crc_step(crc, sector, 512);
++        memcpy(&entries[i], sector, sizeof(entries[i]));
++        entries[i].path[255] = 0;
++        if (entries[i].path[0] != '/' || (entries[i].offset & 511u) || entries[i].offset + entries[i].size > h.bytes) {
++            printf("OCEAN DROP: bad entry %u\n", i);
++            return;
++        }
++    }
++    uint64_t sectors = (h.bytes + 511u) / 512u;
++    for (uint64_t s = 0; s < sectors; s += OCEAN_DROP_CHUNK) {
++        uint32_t n = (uint32_t)MIN(sectors - s, (uint64_t)OCEAN_DROP_CHUNK);
++        if (drop_read(data_lba + s, n, ocean_drop_buf)) { printf("OCEAN DROP: data read failed\n"); return; }
++        crc = crc_step(crc, ocean_drop_buf, n * 512u);
++    }
++    if (~crc != h.crc) {
++        printf("OCEAN DROP: CRC %08x, header says %08x: nothing written\n", ~crc, h.crc);
++        return;
++    }
++    printf("OCEAN DROP: %u files, %llu bytes, CRC ok\n", h.count, h.bytes);
++    int failed = 0;
++    for (uint32_t i = 0; i < h.count; i++) {
++        int error = drop_file(&entries[i], data_lba);
++        printf("OCEAN DROP: %s (%llu bytes, mode %o) -> %s %d\n", entries[i].path, entries[i].size,
++            entries[i].mode, error ? "FAILED" : "written", error);
++        failed += error != 0;
++    }
++    if (failed) {
++        printf("OCEAN DROP: %d failed, left for the next boot\n", failed);
++        return;
++    }
++    h.state = 1;
++    memcpy(sector, &h, sizeof(h));
++    int error = drop_write_header(sector);
++    printf("OCEAN DROP: done%s\n", error ? " (marking it done FAILED)" : "");
++}
++
++static void drop_start(void) {
++    int enabled = 1;
++    thread_t thread;
++    PE_parse_boot_argn("oceandrop", &enabled, sizeof(enabled));
++    if (!enabled || !ocean_writable) { return; }
++    if (kernel_thread_start(drop_thread, NULL, &thread) == KERN_SUCCESS) {
++        thread_deallocate(thread);
++    }
++}
++
+ int ocean_sdhci_rootdev(dev_t *dev) {
+     if (!ocean_ready) {
+         int error=map_host(); if (error) { return error; }
+@@ -955,6 +1119,7 @@
+         devfs_make_node(ocean_dev,DEVFS_BLOCK,UID_ROOT,GID_OPERATOR,mode,"oceanroot0");
+         devfs_make_node(makedev(cmajor,0),DEVFS_CHAR,UID_ROOT,GID_OPERATOR,mode,"roceanroot0");
+         log_start();
++        drop_start();
+         ocean_touch_start();
+         ocean_cpu_boost_start();
+         ocean_gpu_start();
+diff --git a/iokit/Kernel/arm/OceanGPU.cpp b/iokit/Kernel/arm/OceanGPU.cpp
+--- a/iokit/Kernel/arm/OceanGPU.cpp
++++ b/iokit/Kernel/arm/OceanGPU.cpp
+@@ -90,6 +90,11 @@
+ 	kMsmSubmitQueueNew      = 0x4a,
+ 	kMsmSubmitQueueClose    = 0x4b,
+ 	kMsmSubmitQueueQuery    = 0x4c,
++	kOceanLog               = 0x7d,         /* ours: a line of a test's into the kernel log (persistent log) */
++};
++
++struct ocean_log_line {
++	char text[240];
+ };
+ 
+ struct msm_timespec {
+@@ -595,6 +600,7 @@
+ 		struct msm_submitqueue queue;
+ 		struct msm_submitqueue_query query;
+ 		struct drm_gem_close close;
++		struct ocean_log_line log;
+ 	} r;
+ 	size_t size = args->structureInputSize;
+ 	struct gpu_buffer *b;
+@@ -668,6 +674,10 @@
+ 		}
+ 		IOLockUnlock(gGPULock);
+ 		break;
++	case kOceanLog:
++		r.log.text[sizeof(r.log.text) - 1] = 0;
++		IOLog("OceanGPU client: %s\n", r.log.text);
++		break;
+ 	default:
+ 		IOLog("OceanGPU: request %#x (%zu bytes) is not known here\n", selector, size);
+ 		ret = kIOReturnUnsupported;
