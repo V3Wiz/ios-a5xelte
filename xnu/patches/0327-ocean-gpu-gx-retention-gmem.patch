@@ -1,0 +1,35 @@
+diff --git a/bsd/dev/ocean_gpu.c b/bsd/dev/ocean_gpu.c
+--- a/bsd/dev/ocean_gpu.c
++++ b/bsd/dev/ocean_gpu.c
+@@ -549,6 +549,17 @@
+             (ack & 2u) ? "BHS_EN_REST_ACK" : "no ack", rd(ldo, LDO_PWRSWITCH));
+         gx = gdsc_on(gcc, GX_GDSC);
+     }
++    /* test32: the first GPU register read hung with GX on. Mainline
++     * gcc-msm8953.c lists cxcs 0x59000 and 0x59024 for oxili_gx (0x59020 for
++     * oxili_cx): gdsc_force_mem_on sets RETAIN_MEM/PERIPH (bits 14, 13) on
++     * them. 0x59024 is the GMEM clock branch on MSM8916 (OXILI_GMEM_CBCR);
++     * also enable it as a branch here. */
++    uint32_t gmem = rd(gcc, 0x59024);
++    wr(gcc, GFX3D_CMD, rd(gcc, GFX3D_CMD) | (1u << 14) | (1u << 13));
++    wr(gcc, 0x59024, gmem | (1u << 14) | (1u << 13));
++    bool gmem_on = branch_on(gcc, 0x59024);
++    printf("OCEAN GPU: 0x59024 %08x -> %08x (%s), gfx3d cmd %08x\n", gmem, rd(gcc, 0x59024),
++        gmem_on ? "branch on" : "branch still off", rd(gcc, GFX3D_CMD));
+     wr(gcc, CBCR_GFX3D, rd(gcc, CBCR_GFX3D) | (1u << 14) | (1u << 13));
+     bool core = branch_on(gcc, CBCR_GFX3D);
+     bool timer = branch_on(gcc, CBCR_TIMER);
+@@ -573,6 +584,13 @@
+         printf("OCEAN GPU: GPU map failed\n");
+         return;
+     }
++    /* The GPU SMMU is a separate block on the same bus (clocks: oxili_ahb,
++     * bimc_gfx): if it answers and the core does not, the core is the issue. */
++    vm_offset_t smmu = ml_io_map(SMMU_PA, 0x10000);
++    printf("OCEAN GPU: next: GPU SMMU sCR0 (separate block)\n");
++    pause_s(3);
++    uint32_t cr0 = smmu ? rd(smmu, 0) : 0;
++    printf("OCEAN GPU: SMMU sCR0 %08x IDR0 %08x\n", cr0, smmu ? rd(smmu, 0x20) : 0);
+     printf("OCEAN GPU: next: RBBM_STATUS (core register block)\n");
+     pause_s(3);
+     uint32_t status = rd(gpu, 0x4f5 * 4);
