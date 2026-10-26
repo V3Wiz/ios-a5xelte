@@ -1,0 +1,719 @@
+diff --git a/bsd/dev/ocean_gpu.c b/bsd/dev/ocean_gpu.c
+--- a/bsd/dev/ocean_gpu.c
++++ b/bsd/dev/ocean_gpu.c
+@@ -533,6 +533,7 @@
+ #define GPU_RING_WORDS          (GPU_RING_BYTES / 4)
+ #define GPU_FENCE_AT            0x40u           /* in the scratch page */
+ #define GPU_GMEM_BYTES          (0x20000u + 0x2000u)
++extern void OceanGPUStart(void);        /* iokit/Kernel/arm/OceanGPU.cpp */
+ #define CP_INDIRECT_BUFFER_PFE  0x3f
+ #define CP_EVENT_WRITE          0x46
+ #define CACHE_FLUSH_TS          4
+@@ -976,6 +977,7 @@
+     if (!keep_selftest()) { return; }
+     keep.kept = true;
+     printf("OCEAN GPU: THE GPU STAYS ON for programs to draw with\n");
++    OceanGPUStart();
+ }
+ 
+ static void gpu_thread(void *arg, __unused wait_result_t wr_result) {
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -17,6 +17,7 @@
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/A5XELTEGPU.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/OceanGPU.cpp                                    optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
+diff --git a/iokit/Kernel/arm/OceanGPU.cpp b/iokit/Kernel/arm/OceanGPU.cpp
+new file mode 100644
+--- /dev/null
++++ b/iokit/Kernel/arm/OceanGPU.cpp
+@@ -0,0 +1,684 @@
++/*
++ * Copyright (c) 2025-2026 the HakiOS authors; Moto (ocean) port 2026.
++ *
++ * @APPLE_OSREFERENCE_LICENSE_HEADER_START@
++ *
++ * This file contains Original Code and/or Modifications of Original Code
++ * as defined in and that are subject to the Apple Public Source License
++ * Version 2.0 (the 'License'). You may not use this file except in
++ * compliance with the License. The rights granted to you under the License
++ * may not be used to create, or enable the creation or redistribution of,
++ * unlawful or unlicensed copies of an Apple operating system, or to
++ * circumvent, violate, or enable the circumvention or violation of, any
++ * terms of an Apple operating system software license agreement.
++ *
++ * Please obtain a copy of the License at
++ * http://www.opensource.apple.com/apsl/ and read it before using this file.
++ *
++ * The Original Code and all software distributed under the License are
++ * distributed on an 'AS IS' basis, WITHOUT WARRANTY OF ANY KIND, EITHER
++ * EXPRESS OR IMPLIED, AND APPLE HEREBY DISCLAIMS ALL SUCH WARRANTIES,
++ * INCLUDING WITHOUT LIMITATION, ANY WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE, QUIET ENJOYMENT OR NON-INFRINGEMENT.
++ * Please see the License for the specific language governing rights and
++ * limitations under the License.
++ *
++ * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
++ */
++/*
++ * OceanGPU: the Moto G7 Power's Adreno 506 for programs to draw with.
++ *
++ * Ported from HakiOS's iokit/Kernel/hakios.gpu.cpp (APSL 2.0,
++ * github.com/oosexgang/hackios-xnu-kernel). bsd/dev/ocean_gpu.c stage 4
++ * (boot-arg ocean_gpu=4) powers the GPU, gives its 3D core an address space
++ * and a ring, checks it with a self-test and then starts this service. A
++ * program that opens it speaks the interface of Linux's msm DRM driver, the
++ * one Mesa's freedreno knows: every request is a call of the user client with
++ * the request's number as the selector and its structure passed in and back
++ * (userland: HakiOS's tools/mesa/hakios-drm libdrm shim with the service name
++ * "OceanGPU"). What Linux does with mmap() on the device is the client memory
++ * of the type that is the buffer's handle.
++ *
++ * Buffers are wired, zeroed, write-combined kernel memory entered page by
++ * page into the 3D core's SMMU context. Not here yet (HakiOS has them): the
++ * cache of given-back buffers, statistics, IOSurfaces as buffers, showing a
++ * test's pixels; interrupts (waiting polls the fence).
++ */
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ARM64_BOARD_CONFIG_OCEAN)
++#include <IOKit/IOLib.h>
++#include <IOKit/IOLocks.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <kern/clock.h>
++#include <mach/mach_time.h>
++#include <sys/systm.h>
++
++extern "C" {
++/* bsd/dev/ocean_gpu.c, stage 4 */
++bool ocean_gpu_ready(void);
++bool ocean_gpu_parameter(uint32_t which, uint64_t *value);
++uint64_t ocean_gpu_address(uint64_t size);
++void ocean_gpu_address_free(uint64_t address, uint64_t size);
++bool ocean_gpu_map(uint64_t address, uint64_t phys, bool read_only);
++void ocean_gpu_mapped(void);
++void ocean_gpu_unmap(uint64_t address, uint64_t size);
++uint32_t ocean_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
++bool ocean_gpu_done(uint32_t fence);
++uint32_t ocean_gpu_last(void);
++void ocean_gpu_report(const char *why);
++
++void OceanGPUStart(void);
++}
++
++/* Linux's include/uapi/drm/msm_drm.h and drm.h: the requests' numbers and structures. */
++enum {
++	kDrmGemClose            = 0x09,
++	kMsmGetParam            = 0x40,
++	kMsmSetParam            = 0x41,
++	kMsmGemNew              = 0x42,
++	kMsmGemInfo             = 0x43,
++	kMsmGemCpuPrep          = 0x44,
++	kMsmGemCpuFini          = 0x45,
++	kMsmGemSubmit           = 0x46,
++	kMsmWaitFence           = 0x47,
++	kMsmGemMadvise          = 0x48,
++	kMsmSubmitQueueNew      = 0x4a,
++	kMsmSubmitQueueClose    = 0x4b,
++	kMsmSubmitQueueQuery    = 0x4c,
++};
++
++struct msm_timespec {
++	int64_t seconds, nanoseconds;
++};
++struct msm_param {
++	uint32_t pipe, param;
++	uint64_t value;
++	uint32_t len, pad;
++};
++struct msm_gem_new {
++	uint64_t size;
++	uint32_t flags, handle;
++};
++struct msm_gem_info {
++	uint32_t handle, info;
++	uint64_t value;
++	uint32_t len, pad;
++};
++struct msm_gem_cpu_prep {
++	uint32_t handle, op;
++	struct msm_timespec timeout;
++};
++struct msm_gem_submit_cmd {
++	uint32_t type, submit_idx, submit_offset, size, pad, nr_relocs;
++	uint64_t relocs;
++};
++struct msm_gem_submit_bo {
++	uint32_t flags, handle;
++	uint64_t presumed;
++};
++struct msm_gem_submit {
++	uint32_t flags, fence, nr_bos, nr_cmds;
++	uint64_t bos, cmds;
++	int32_t fence_fd;
++	uint32_t queueid;
++	uint64_t in_syncobjs, out_syncobjs;
++	uint32_t nr_in_syncobjs, nr_out_syncobjs, syncobj_stride, pad;
++};
++struct msm_wait_fence {
++	uint32_t fence, flags;
++	struct msm_timespec timeout;
++	uint32_t queueid;
++};
++struct msm_gem_madvise {
++	uint32_t handle, madv, retained;
++};
++struct msm_submitqueue {
++	uint32_t flags, prio, id;
++};
++struct msm_submitqueue_query {
++	uint64_t data;
++	uint32_t id, param, len, pad;
++};
++struct drm_gem_close {
++	uint32_t handle, pad;
++};
++
++#define MSM_INFO_GET_OFFSET     0
++#define MSM_INFO_GET_IOVA       1
++#define MSM_INFO_SET_NAME       2
++#define MSM_INFO_GET_FLAGS      5
++#define MSM_BO_GPU_READONLY     0x00000002
++#define MSM_PREP_NOSYNC         0x04
++#define MSM_SUBMIT_CMD_BUF      1
++#define MSM_SUBMIT_FENCE_FD_OUT 0x20000000
++
++#define GPU_BUFFERS             8192            /* a client's, at most */
++#define GPU_BUFFER_MAX          (128u << 20)
++#define GPU_SUBMIT_CMDS         128
++#define GPU_SUBMIT_BOS          8192
++#define GPU_PATIENCE_MS         5000
++#define GPU_ASK_AGAIN_US        200
++
++static IOLock *gGPULock;                        /* around everything that is the GPU's (ocean_gpu_...) */
++static bool gGPUReported;
++
++/* Wait for the 3D core to be done with submission `fence`; with the lock held, let go of while waiting. */
++static bool
++gpuWait(uint32_t fence, uint64_t milliseconds)
++{
++	uint64_t began = mach_absolute_time(), patience;
++
++	nanoseconds_to_absolutetime(milliseconds * NSEC_PER_MSEC, &patience);
++	for (;;) {
++		if (ocean_gpu_done(fence)) {
++			return true;
++		}
++		if (mach_absolute_time() - began >= patience || gGPUReported) {
++			break;
++		}
++		IOLockUnlock(gGPULock);
++		delay_for_interval(GPU_ASK_AGAIN_US, NSEC_PER_USEC);
++		IOLockLock(gGPULock);
++	}
++	if (milliseconds >= 1000 && !gGPUReported) {
++		gGPUReported = true;
++		ocean_gpu_report("no answer");
++	}
++	return false;
++}
++
++/* How long from now a time of msm's is, in milliseconds; 0: now or past. */
++static uint64_t
++millisecondsUntil(const struct msm_timespec *when)
++{
++	uint64_t now;
++	int64_t left;
++
++	absolutetime_to_nanoseconds(mach_continuous_time(), &now);
++	left = when->seconds * (int64_t)NSEC_PER_SEC + when->nanoseconds - (int64_t)now;
++	if (left <= 0) {
++		return 0;
++	}
++	return (uint64_t)left / NSEC_PER_MSEC > GPU_PATIENCE_MS ? GPU_PATIENCE_MS : (uint64_t)left / NSEC_PER_MSEC;
++}
++
++class OceanGPU : public IOService
++{
++	OSDeclareDefaultStructors(OceanGPU);
++
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(OceanGPU, IOService);
++
++bool
++OceanGPU::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	setProperty(kIOUserClientClassKey, "OceanGPUUserClient");
++	setName("OceanGPU");
++	registerService();
++	return true;
++}
++
++void
++OceanGPUStart(void)
++{
++	IOService *provider = IOService::getPlatform();
++	OceanGPU *gpu;
++
++	gGPULock = IOLockAlloc();
++	gpu = OSTypeAlloc(OceanGPU);
++	if (gGPULock == NULL || gpu == NULL || provider == NULL || !gpu->init() || !gpu->attach(provider)) {
++		OSSafeReleaseNULL(gpu);
++		IOLog("OceanGPU: cannot create the service\n");
++		return;
++	}
++	if (!gpu->start(provider)) {
++		gpu->detach(provider);
++		IOLog("OceanGPU: the service did not start\n");
++	} else {
++		IOLog("OceanGPU: service up (msm DRM requests through its user client)\n");
++	}
++	gpu->release();
++}
++
++struct gpu_buffer {
++	IOBufferMemoryDescriptor *      memory;         /* NULL: this handle is free */
++	uint64_t                        address;        /* the GPU's for it */
++	uint64_t                        size;
++	uint32_t                        flags;
++	uint32_t                        fence;          /* the last submission that names it (0: none has) */
++};
++
++/* A buffer given back while the GPU is still at it: kept until that submission is done. */
++struct gpu_left {
++	IOBufferMemoryDescriptor *      memory;
++	uint64_t                        address, size;
++	uint32_t                        fence;
++};
++#define GPU_LEFT                64
++
++class OceanGPUUserClient : public IOUserClient
++{
++	OSDeclareDefaultStructors(OceanGPUUserClient);
++
++	struct gpu_buffer *     fBuffers;               /* handle n is fBuffers[n - 1] */
++	uint32_t                fNextQueue;
++	uint32_t                fNextBuffer;
++	uint32_t                fBufferCount;
++	uint64_t                fBufferBytes;
++	uint32_t                fSubmits;
++	uint32_t                fStrangers;
++	struct gpu_left         fLeft[GPU_LEFT];
++	uint32_t                fLeftCount;
++
++	struct gpu_buffer *buffer(uint32_t handle);
++	void freeBuffer(struct gpu_buffer *b);
++	void reap(void);
++	IOReturn gemNew(struct msm_gem_new *request);
++	IOReturn gemInfo(struct msm_gem_info *request);
++	IOReturn submit(struct msm_gem_submit *request);
++
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++	virtual void free(void) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(OceanGPUUserClient, IOUserClient);
++
++bool
++OceanGPUUserClient::start(IOService *provider)
++{
++	if (!ocean_gpu_ready() || !IOUserClient::start(provider)) {
++		return false;
++	}
++	fBuffers = IONewZero(struct gpu_buffer, GPU_BUFFERS);
++	return fBuffers != NULL;
++}
++
++/* With the lock held. A buffer the GPU may still use waits in fLeft for its submission. */
++void
++OceanGPUUserClient::freeBuffer(struct gpu_buffer *b)
++{
++	bool busy = b->fence != 0 && !ocean_gpu_done(b->fence);
++
++	if (busy && fLeftCount == GPU_LEFT) {
++		busy = !gpuWait(b->fence, 1000);
++	}
++	if (busy && fLeftCount < GPU_LEFT) {
++		struct gpu_left *left = &fLeft[fLeftCount++];
++
++		left->memory = b->memory;
++		left->address = b->address;
++		left->size = b->size;
++		left->fence = b->fence;
++	} else if (busy) {
++		static uint32_t said;
++
++		if (said++ < 8) {
++			IOLog("OceanGPU: the GPU is not done with a buffer of %llu bytes: it stays the GPU's\n", b->size);
++		}
++	} else {
++		ocean_gpu_unmap(b->address, b->size);
++		ocean_gpu_address_free(b->address, b->size);
++		b->memory->release();
++	}
++	b->memory = NULL;
++	fBufferCount--;
++	fBufferBytes -= b->size;
++}
++
++/* The buffers given back early that the GPU is done with now: freed. With the lock held. */
++void
++OceanGPUUserClient::reap(void)
++{
++	for (uint32_t i = 0; i < fLeftCount;) {
++		struct gpu_left *left = &fLeft[i];
++
++		if (!ocean_gpu_done(left->fence)) {
++			i++;
++			continue;
++		}
++		ocean_gpu_unmap(left->address, left->size);
++		ocean_gpu_address_free(left->address, left->size);
++		left->memory->release();
++		*left = fLeft[--fLeftCount];
++	}
++}
++
++IOReturn
++OceanGPUUserClient::clientClose(void)
++{
++	if (fBuffers != NULL) {
++		IOLockLock(gGPULock);
++		gpuWait(ocean_gpu_last(), 1000);
++		for (uint32_t i = 0; i < GPU_BUFFERS; i++) {
++			if (fBuffers[i].memory != NULL) {
++				freeBuffer(&fBuffers[i]);
++			}
++		}
++		reap();
++		if (fLeftCount != 0) {
++			IOLog("OceanGPU: the GPU is not done with %u buffers of a program that is gone: they stay its own\n", fLeftCount);
++		}
++		IOLockUnlock(gGPULock);
++	}
++	if (!isInactive()) {
++		terminate();
++	}
++	return kIOReturnSuccess;
++}
++
++void
++OceanGPUUserClient::free(void)
++{
++	if (fBuffers != NULL) {
++		IODelete(fBuffers, struct gpu_buffer, GPU_BUFFERS);
++		fBuffers = NULL;
++	}
++	IOUserClient::free();
++}
++
++struct gpu_buffer *
++OceanGPUUserClient::buffer(uint32_t handle)
++{
++	if (handle == 0 || handle > GPU_BUFFERS || fBuffers[handle - 1].memory == NULL) {
++		if (handle != 0 && fStrangers++ < 16) {
++			IOLog("OceanGPU: buffer %u is asked for and is not there\n", handle);
++		}
++		return NULL;
++	}
++	return &fBuffers[handle - 1];
++}
++
++IOReturn
++OceanGPUUserClient::gemNew(struct msm_gem_new *request)
++{
++	uint64_t size = round_page_64(request->size);
++	struct gpu_buffer *b = NULL;
++	IOBufferMemoryDescriptor *memory;
++	bool mapped = true;
++
++	if (size == 0 || size > GPU_BUFFER_MAX) {
++		return kIOReturnBadArgument;
++	}
++	/* zeroed, and write-combined: what the program writes goes to memory, where the GPU reads it */
++	memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared |
++	    kIOMapWriteCombineCache, (vm_size_t)size, PAGE_SIZE);
++	if (memory == NULL) {
++		IOLog("OceanGPU: no memory for a buffer of %llu bytes (%u buffers, %llu MB)\n", size, fBufferCount,
++		    fBufferBytes >> 20);
++		return kIOReturnNoMemory;
++	}
++	IOLockLock(gGPULock);
++	for (uint32_t n = 0; n < GPU_BUFFERS; n++) {
++		uint32_t i = (fNextBuffer + n) % GPU_BUFFERS;
++
++		if (fBuffers[i].memory == NULL) {
++			b = &fBuffers[i];
++			request->handle = i + 1;
++			fNextBuffer = i + 1;
++			break;
++		}
++	}
++	if (b == NULL || (b->address = ocean_gpu_address(size)) == 0) {
++		IOLockUnlock(gGPULock);
++		IOLog("OceanGPU: no %s left for a buffer of %llu bytes\n", b ? "addresses" : "handles", size);
++		memory->release();
++		return kIOReturnNoMemory;
++	}
++	for (uint64_t offset = 0; offset < size && mapped; offset += PAGE_SIZE) {
++		IOByteCount length = 0;
++		addr64_t phys = memory->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
++
++		mapped = phys != 0 && ocean_gpu_map(b->address + offset, phys, request->flags & MSM_BO_GPU_READONLY);
++	}
++	ocean_gpu_mapped();
++	if (!mapped) {
++		ocean_gpu_unmap(b->address, size);
++		ocean_gpu_address_free(b->address, size);
++		IOLockUnlock(gGPULock);
++		IOLog("OceanGPU: a buffer of %llu bytes cannot be entered into the GPU's address space\n", size);
++		memory->release();
++		return kIOReturnNoMemory;
++	}
++	b->memory = memory;
++	b->size = size;
++	b->flags = request->flags;
++	b->fence = 0;
++	fBufferCount++;
++	fBufferBytes += size;
++	IOLockUnlock(gGPULock);
++	return kIOReturnSuccess;
++}
++
++IOReturn
++OceanGPUUserClient::gemInfo(struct msm_gem_info *request)
++{
++	struct gpu_buffer *b;
++	IOReturn ret = kIOReturnSuccess;
++
++	IOLockLock(gGPULock);
++	b = buffer(request->handle);
++	if (b == NULL) {
++		ret = kIOReturnBadArgument;
++	} else if (request->info == MSM_INFO_GET_OFFSET) {
++		request->value = (uint64_t)request->handle << 32;      /* nobody maps by it here */
++	} else if (request->info == MSM_INFO_GET_IOVA) {
++		request->value = b->address;
++	} else if (request->info == MSM_INFO_GET_FLAGS) {
++		request->value = b->flags;
++	} else if (request->info != MSM_INFO_SET_NAME) {
++		ret = kIOReturnUnsupported;
++	}
++	IOLockUnlock(gGPULock);
++	return ret;
++}
++
++IOReturn
++OceanGPUUserClient::submit(struct msm_gem_submit *request)
++{
++	struct msm_gem_submit_bo *bos = NULL;
++	struct msm_gem_submit_cmd *cmds = NULL;
++	uint64_t addresses[GPU_SUBMIT_CMDS];
++	uint32_t words[GPU_SUBMIT_CMDS], count = 0;
++	IOReturn ret = kIOReturnBadArgument;
++
++	if (request->nr_cmds == 0 || request->nr_cmds > GPU_SUBMIT_CMDS || request->nr_bos == 0 || request->nr_bos > GPU_SUBMIT_BOS) {
++		IOLog("OceanGPU: a submission of %u command buffers in %u buffers: not taken\n", request->nr_cmds, request->nr_bos);
++		return kIOReturnBadArgument;
++	}
++	bos = IONew(struct msm_gem_submit_bo, request->nr_bos);
++	cmds = IONew(struct msm_gem_submit_cmd, request->nr_cmds);
++	if (bos == NULL || cmds == NULL) {
++		ret = kIOReturnNoMemory;
++		goto out;
++	}
++	if (copyin((user_addr_t)request->bos, bos, request->nr_bos * sizeof(*bos)) != 0 ||
++	    copyin((user_addr_t)request->cmds, cmds, request->nr_cmds * sizeof(*cmds)) != 0) {
++		ret = kIOReturnVMError;
++		goto out;
++	}
++	IOLockLock(gGPULock);
++	__asm__ volatile ("dsb sy" ::: "memory");      /* the program's write-combined writes are in memory */
++	for (uint32_t i = 0; i < request->nr_cmds; i++) {
++		struct gpu_buffer *b = cmds[i].submit_idx < request->nr_bos ? buffer(bos[cmds[i].submit_idx].handle) : NULL;
++
++		if (cmds[i].type != MSM_SUBMIT_CMD_BUF) {
++			continue;                               /* the other kinds are for a GPU shared between address spaces */
++		}
++		if (b == NULL || cmds[i].nr_relocs != 0 || (cmds[i].size & 3) || (cmds[i].submit_offset & 3) ||
++		    (uint64_t)cmds[i].submit_offset + cmds[i].size > b->size) {
++			IOLog("OceanGPU: command buffer %u of a submission: buffer %u, offset %u, %u bytes, %u relocations: not taken\n",
++			    i, cmds[i].submit_idx, cmds[i].submit_offset, cmds[i].size, cmds[i].nr_relocs);
++			IOLockUnlock(gGPULock);
++			goto out;
++		}
++		addresses[count] = b->address + cmds[i].submit_offset;
++		words[count++] = cmds[i].size / 4;
++	}
++	request->fence = count != 0 ? ocean_gpu_submit(addresses, words, count) : ocean_gpu_last();
++	if (request->flags & MSM_SUBMIT_FENCE_FD_OUT) {
++		request->fence_fd = -1;
++	}
++	for (uint32_t i = 0; request->fence != 0 && i < request->nr_bos; i++) {
++		struct gpu_buffer *b = buffer(bos[i].handle);
++
++		if (b != NULL) {
++			b->fence = request->fence;
++		}
++	}
++	reap();
++	if (request->fence == 0 && !gGPUReported) {
++		gGPUReported = true;
++		ocean_gpu_report("the ring is full");
++	}
++	if (fSubmits++ < 4) {
++		IOLog("OceanGPU: submission %u: %u command buffers, the first at %#llx, %u words\n", request->fence, count,
++		    count ? addresses[0] : 0, count ? words[0] : 0);
++	}
++	IOLockUnlock(gGPULock);
++	ret = request->fence != 0 ? kIOReturnSuccess : kIOReturnTimeout;
++out:
++	if (bos != NULL) {
++		IODelete(bos, struct msm_gem_submit_bo, request->nr_bos);
++	}
++	if (cmds != NULL) {
++		IODelete(cmds, struct msm_gem_submit_cmd, request->nr_cmds);
++	}
++	return ret;
++}
++
++IOReturn
++OceanGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
++{
++	struct gpu_buffer *b;
++	IOReturn ret = kIOReturnBadArgument;
++
++	IOLockLock(gGPULock);
++	b = buffer(type);
++	if (b != NULL) {
++		b->memory->retain();
++		*memory = b->memory;
++		*options = 0;
++		ret = kIOReturnSuccess;
++	}
++	IOLockUnlock(gGPULock);
++	return ret;
++}
++
++IOReturn
++OceanGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
++    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference)
++{
++	union {
++		struct msm_param param;
++		struct msm_gem_new gemNew;
++		struct msm_gem_info gemInfo;
++		struct msm_gem_cpu_prep cpuPrep;
++		struct msm_gem_submit submit;
++		struct msm_wait_fence waitFence;
++		struct msm_gem_madvise madvise;
++		struct msm_submitqueue queue;
++		struct msm_submitqueue_query query;
++		struct drm_gem_close close;
++	} r;
++	size_t size = args->structureInputSize;
++	struct gpu_buffer *b;
++	IOReturn ret = kIOReturnSuccess;
++	uint64_t zero = 0, patience;
++
++	(void)dispatch;
++	(void)target;
++	(void)reference;
++	if (args->structureInput == NULL || size > sizeof(r) || fBuffers == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (!ocean_gpu_ready()) {
++		return kIOReturnNotReady;
++	}
++	bzero(&r, sizeof(r));
++	memcpy(&r, args->structureInput, size);
++
++	switch (selector) {
++	case kMsmGetParam:
++		ret = ocean_gpu_parameter(r.param.param, &r.param.value) ? kIOReturnSuccess : kIOReturnBadArgument;
++		break;
++	case kMsmSetParam:
++	case kMsmGemCpuFini:
++	case kMsmSubmitQueueClose:
++		break;
++	case kMsmGemNew:
++		ret = gemNew(&r.gemNew);
++		break;
++	case kMsmGemInfo:
++		ret = gemInfo(&r.gemInfo);
++		break;
++	case kMsmGemCpuPrep:                            /* is the GPU done with a buffer: with all it has been given, here */
++		IOLockLock(gGPULock);
++		patience = (r.cpuPrep.op & MSM_PREP_NOSYNC) ? 0 : millisecondsUntil(&r.cpuPrep.timeout);
++		if (!gpuWait(ocean_gpu_last(), patience)) {
++			ret = kIOReturnBusy;
++		}
++		IOLockUnlock(gGPULock);
++		break;
++	case kMsmGemSubmit:
++		ret = submit(&r.submit);
++		break;
++	case kMsmWaitFence:
++		IOLockLock(gGPULock);
++		patience = millisecondsUntil(&r.waitFence.timeout);
++		if (!gpuWait(r.waitFence.fence, patience)) {
++			ret = kIOReturnTimeout;
++		}
++		IOLockUnlock(gGPULock);
++		break;
++	case kMsmGemMadvise:
++		r.madvise.retained = 1;
++		break;
++	case kMsmSubmitQueueNew:
++		r.queue.id = ++fNextQueue;
++		break;
++	case kMsmSubmitQueueQuery:                      /* how often the GPU has faulted on this client's commands */
++		if (r.query.data != 0 && r.query.len >= sizeof(zero)) {
++			copyout(&zero, (user_addr_t)r.query.data, sizeof(zero));
++		}
++		break;
++	case kDrmGemClose:
++		IOLockLock(gGPULock);
++		b = buffer(r.close.handle);
++		if (b == NULL) {
++			ret = kIOReturnBadArgument;
++		} else {
++			freeBuffer(b);
++			reap();
++		}
++		IOLockUnlock(gGPULock);
++		break;
++	default:
++		IOLog("OceanGPU: request %#x (%zu bytes) is not known here\n", selector, size);
++		ret = kIOReturnUnsupported;
++		break;
++	}
++	if (ret == kIOReturnSuccess && args->structureOutput != NULL) {
++		if (args->structureOutputSize > size) {
++			args->structureOutputSize = (uint32_t)size;
++		}
++		memcpy(args->structureOutput, &r, args->structureOutputSize);
++	}
++	return ret;
++}
++#endif /* ARM64_BOARD_CONFIG_OCEAN */
