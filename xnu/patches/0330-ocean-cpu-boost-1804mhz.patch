@@ -1,0 +1,226 @@
+diff --git a/bsd/dev/ocean_gpu.c b/bsd/dev/ocean_gpu.c
+--- a/bsd/dev/ocean_gpu.c
++++ b/bsd/dev/ocean_gpu.c
+@@ -644,6 +644,203 @@
+         ok ? "-> GPLL0, about 800 MHz" : "update TIMEOUT", rd(apcs, 0x50), rd(apcs, 0x54), cfg);
+ }
+ 
++/*
++ * CPU boost to the SDM632 top corner, boot-arg ocean_cpumax=N (stages):
++ * 1 = rail to the corner-7 ceiling with the APM and mem-acc changes it needs,
++ * 2 = also Gold (perfcl) PLL at 1804.8 MHz, 3 = also the boot cluster
++ * (pwrcl). All values from the stock FDT and Motorola's drivers:
++ *   - Rail pm8953_s5 (FTS2.5, range 0: vlevel = (uV - 80 mV) / 5 mV) is set
++ *     through the CCI SAW (spm-v2 at 0xb1d2000, SAW v4.1 offsets): msm-spm.c
++ *     msm_spm_drv_set_vdd. Both clusters share it; cpr4 ceilings per corner
++ *     720/790/865/865/920/990/1065 mV, corner 7 = pwrcl 1804.8 MHz.
++ *   - APM (qcom,msm8953-apm 0xb111000): arrays move from MX to APCC at
++ *     875 mV; cpr3 stops the rail at the threshold, switches, then goes on.
++ *   - mem-acc (apc-mem-acc-regulator 0xb1d1360..70): CPR corner 7 = acc
++ *     corner 3, applied after the voltage increase (corner1/2 -> 3 lists).
++ *   - PLLs (clock-cpu-sdm632.c, clock-pll.c variable_rate_pll): pwrcl
++ *     0xb116000, perfcl 0xb016000, L = rate / 19.2 MHz, cluster mux source
++ *     5 with divider field 1, then the CORE CBCR at mux + 8.
++ * Pauses between stages keep the last good step in the persistent log.
++ */
++#define SAW_PA          0x0b1d2000u
++#define SAW_ID          0xc04u
++#define SAW_PMIC_STS    0xc18u
++#define SAW_RST         0xc1cu
++#define SAW_VCTL        0x900u
++#define SAW_AVS_CTL     0x904u
++#define SAW_PMIC_DATA3  0x04cu
++#define APM_PA          0x0b111000u
++#define APM_MODE        0x2a8u
++#define APM_STS         0x2b0u
++#define APM_DLY         0x2acu
++#define MEMACC_PA       0x0b1d1000u
++#define VLEVEL_APM      0x9fu           /* 875 mV */
++#define VLEVEL_TOP      0xc5u           /* 1065 mV */
++#define PLL_L_TOP       94u             /* 94 x 19.2 MHz = 1804.8 MHz */
++
++static uint32_t saw_level(vm_offset_t saw) { return rd(saw, SAW_PMIC_STS) & 0x300ffu; }
++
++static bool saw_set_vdd(vm_offset_t saw, uint32_t vlevel) {
++    uint32_t avs = rd(saw, SAW_AVS_CTL);
++    if (avs & 1u) { wr(saw, SAW_AVS_CTL, avs & ~(1u << 27)); }
++    wr(saw, SAW_RST, 1);
++    wr(saw, SAW_VCTL, (rd(saw, SAW_VCTL) & ~0x700ffu) | vlevel);
++    wr(saw, SAW_PMIC_DATA3, (rd(saw, SAW_PMIC_DATA3) & ~0x700ffu) | vlevel);
++    bool ok = false;
++    for (unsigned i = 0; i < 500 && !ok; i++) {
++        delay(1);
++        ok = saw_level(saw) == vlevel;
++    }
++    /* msm-spm.c re-enables AVS with limits from vlevel & 0x3f, which for the
++     * levels used here would clamp the rail; AVS stays paused instead. */
++    if (avs & 1u) { printf("OCEAN CPU: SAW AVS was on (%08x), left paused\n", avs); }
++    delay(5000);                        /* slew (worst case ~3 ms) + settling */
++    return ok;
++}
++
++static bool apm_apcc(vm_offset_t apm) {
++    wr(apm, APM_DLY, 0x02111001);       /* post-halt 2, halt-clk 0x11, resume 0x10, sel 1 */
++    wr(apm, APM_MODE, 2);
++    for (unsigned i = 0; i < 500; i++) {
++        if ((rd(apm, APM_STS) & 0x1fu) == 3) { return true; }
++        delay(1);
++    }
++    return false;
++}
++
++static bool pll_start(vm_offset_t pll, uint32_t l) {
++    if (rd(pll, 0x00) & 0x7u) {                 /* left running: off and in reset first */
++        wr(pll, 0x00, rd(pll, 0x00) & ~0x7u);
++        delay(10);
++    }
++    wr(pll, 0x18, rd(pll, 0x18) | 0x9u);        /* main + early output */
++    wr(pll, 0x10, 0);                           /* alpha */
++    wr(pll, 0x20, 0x200d4828);                  /* config ctl */
++    wr(pll, 0x24, 0x00000006);
++    wr(pll, 0x30, 0x1c000000);                  /* test ctl */
++    wr(pll, 0x34, 0x00004000);
++    wr(pll, 0x08, l);
++    uint32_t mode = rd(pll, 0x00) | (1u << 1);  /* BYPASSNL */
++    wr(pll, 0x00, mode);
++    delay(10);
++    mode |= 1u << 2;                            /* RESET_N */
++    wr(pll, 0x00, mode);
++    delay(200);
++    bool locked = poll(pll, 0x00, 1u << 31, 1u << 31, 2);
++    if (locked) { wr(pll, 0x00, mode | 1u); }   /* OUTCTRL */
++    return locked;
++}
++
++static bool mux_to_pll(vm_offset_t rcg) {
++    wr(rcg, 0x54, (rd(rcg, 0x54) & ~0x71fu) | (5u << 8) | 1u);
++    wr(rcg, 0x50, rd(rcg, 0x50) | 1u);
++    bool ok = poll(rcg, 0x50, 1u, 0, 10);
++    wr(rcg, 0x58, rd(rcg, 0x58) | 1u);          /* CORE CBCR */
++    return ok;
++}
++
++static uint64_t cntpct(void) {
++    uint64_t n;
++    __asm__ volatile("isb\n\tmrs %0, cntpct_el0" : "=r"(n));
++    return n;
++}
++
++static void cpu_mhz(const char *when) {
++    uint64_t mpidr, start = cntpct(), iterations = 0;
++    __asm__ volatile("mrs %0, mpidr_el1" : "=r"(mpidr));
++    while (cntpct() - start < 960000ULL) {      /* 50 ms of the 19.2 MHz counter */
++        uint64_t n = 100000;
++        __asm__ volatile("1: subs %0, %0, #1\n\tb.ne 1b" : "+r"(n));
++        iterations += 100000;
++    }
++    printf("OCEAN CPU: %s about %llu MHz on cpu %s\n", when, iterations / 50000ULL,
++        (mpidr & 0xff00) ? "Gold" : "Silver");
++}
++
++static void cpu_boost_thread(void *arg, __unused wait_result_t wr_result) {
++    int stages = (int)(uintptr_t)arg;
++    vm_offset_t saw = ml_io_map(SAW_PA, 0x1000), apm = ml_io_map(APM_PA, 0x1000);
++    vm_offset_t acc = ml_io_map(MEMACC_PA, 0x1000), rcg1 = ml_io_map(0x0b011000, 0x1000);
++    vm_offset_t pll0 = ml_io_map(0x0b116000, 0x1000), pll1 = ml_io_map(0x0b016000, 0x1000);
++    if (!saw || !apm || !acc || !rcg1 || !pll0 || !pll1) {
++        printf("OCEAN CPU: boost map failed\n");
++        return;
++    }
++    pause_s(4);
++    uint32_t id = rd(saw, SAW_ID), lvl = saw_level(saw);
++    printf("OCEAN CPU: boost %d: saw id %08x pmic %05x vctl %08x avs %08x apm %x/%x dly %08x\n",
++        stages, id, lvl, rd(saw, SAW_VCTL), rd(saw, SAW_AVS_CTL), rd(apm, APM_MODE),
++        rd(apm, APM_STS), rd(apm, APM_DLY));
++    printf("OCEAN CPU: mem-acc %08x %08x %08x %08x %08x\n", rd(acc, 0x360), rd(acc, 0x364),
++        rd(acc, 0x368), rd(acc, 0x36c), rd(acc, 0x370));
++    printf("OCEAN CPU: pwrcl pll %08x l %x mux %08x/%08x; perfcl pll %08x l %x mux %08x/%08x\n",
++        rd(pll0, 0), rd(pll0, 8), rd(apm, 0x50), rd(apm, 0x54), rd(pll1, 0), rd(pll1, 8),
++        rd(rcg1, 0x50), rd(rcg1, 0x54));
++    cpu_mhz("before boost:");
++    if (!(id & (1u << 2)) || (lvl & 0x30000u) || (lvl & 0xffu) < 0x80u || (lvl & 0xffu) > VLEVEL_TOP) {
++        printf("OCEAN CPU: unexpected SAW state, boost skipped\n");
++        return;
++    }
++    pause_s(3);
++
++    /* 1. Rail: stop at the APM threshold, arrays to APCC, then the top. */
++    if ((lvl & 0xffu) < VLEVEL_APM) {
++        bool v = saw_set_vdd(saw, VLEVEL_APM);
++        printf("OCEAN CPU: rail -> 875 mV %s (pmic %05x)\n", v ? "ok" : "NOT CONFIRMED", saw_level(saw));
++        if (!v) { return; }
++    }
++    if ((rd(apm, APM_STS) & 0x1fu) != 3) {
++        bool a = apm_apcc(apm);
++        printf("OCEAN CPU: APM -> APCC %s (sts %x)\n", a ? "ok" : "TIMEOUT", rd(apm, APM_STS));
++        if (!a) { return; }
++    }
++    bool v = saw_set_vdd(saw, VLEVEL_TOP);
++    printf("OCEAN CPU: rail -> 1065 mV %s (pmic %05x)\n", v ? "ok" : "NOT CONFIRMED", saw_level(saw));
++    if (!v) { return; }
++    wr(acc, 0x360, 0);                  /* mem-acc corner 3 */
++    wr(acc, 0x364, 1);
++    wr(acc, 0x368, 0);
++    wr(acc, 0x36c, 0x10000);
++    wr(acc, 0x370, 0);
++    printf("OCEAN CPU: mem-acc corner 3 %08x %08x %08x %08x %08x\n", rd(acc, 0x360),
++        rd(acc, 0x364), rd(acc, 0x368), rd(acc, 0x36c), rd(acc, 0x370));
++    pause_s(3);
++    if (stages < 2) { return; }
++
++    /* 2. Gold. */
++    bool lock = pll_start(pll1, PLL_L_TOP);
++    printf("OCEAN CPU: perfcl pll %s mode %08x l %x\n", lock ? "locked" : "NOT LOCKED", rd(pll1, 0), rd(pll1, 8));
++    if (!lock) { return; }
++    bool m = mux_to_pll(rcg1);
++    printf("OCEAN CPU: Gold mux %s cmd %08x cfg %08x -> 1804.8 MHz\n", m ? "switched" : "update TIMEOUT",
++        rd(rcg1, 0x50), rd(rcg1, 0x54));
++    cpu_mhz("after Gold:");
++    pause_s(3);
++    if (stages < 3) { return; }
++
++    /* 3. Boot cluster. */
++    lock = pll_start(pll0, PLL_L_TOP);
++    printf("OCEAN CPU: pwrcl pll %s mode %08x l %x\n", lock ? "locked" : "NOT LOCKED", rd(pll0, 0), rd(pll0, 8));
++    if (!lock) { return; }
++    m = mux_to_pll(apm);                /* pwrcl mux 0xb111050 shares the APM page */
++    printf("OCEAN CPU: Silver mux %s cmd %08x cfg %08x -> 1804.8 MHz\n", m ? "switched" : "update TIMEOUT",
++        rd(apm, 0x50), rd(apm, 0x54));
++    cpu_mhz("after Silver:");
++    pause_s(2);
++    cpu_mhz("check:");
++}
++
++void ocean_cpu_boost_start(void);
++void ocean_cpu_boost_start(void) {
++    int stages = 0;
++    thread_t thread;
++    PE_parse_boot_argn("ocean_cpumax", &stages, sizeof(stages));
++    if (stages < 1) { return; }
++    if (kernel_thread_start(cpu_boost_thread, (void *)(uintptr_t)stages, &thread) == KERN_SUCCESS) {
++        thread_deallocate(thread);
++    }
++}
++
+ void ocean_gpu_start(void) {
+     int stages = 0;
+     thread_t thread;
+diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
+--- a/bsd/dev/ocean_sdhci.c
++++ b/bsd/dev/ocean_sdhci.c
+@@ -32,6 +32,7 @@
+ extern void ocean_touch_start(void); /* bsd/dev/ocean_touch.c */
+ extern void ocean_gpu_start(void);   /* bsd/dev/ocean_gpu.c */
+ extern void ocean_cpu_clocks(void);  /* bsd/dev/ocean_gpu.c */
++extern void ocean_cpu_boost_start(void);  /* bsd/dev/ocean_gpu.c */
+ int ocean_sdhci_rootdev(dev_t *);
+ static vm_offset_t ocean_regs;
+ static uint64_t ocean_sectors, ocean_first, ocean_length;
+@@ -955,6 +956,7 @@
+         devfs_make_node(makedev(cmajor,0),DEVFS_CHAR,UID_ROOT,GID_OPERATOR,mode,"roceanroot0");
+         log_start();
+         ocean_touch_start();
++        ocean_cpu_boost_start();
+         ocean_gpu_start();
+     }
+     *dev=ocean_dev; return 0;
