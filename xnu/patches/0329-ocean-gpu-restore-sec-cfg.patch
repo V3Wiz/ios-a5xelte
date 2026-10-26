@@ -1,0 +1,31 @@
+diff --git a/bsd/dev/ocean_gpu.c b/bsd/dev/ocean_gpu.c
+--- a/bsd/dev/ocean_gpu.c
++++ b/bsd/dev/ocean_gpu.c
+@@ -105,9 +105,9 @@
+ 
+ /* Zap shader (FDT qcom,kgsl-hyp: pil-tz-generic, pas-id 13, firmware
+  * a506_zap, memory-region gpu_region = CMA in 0x80000000..0x90000000).
+- * 0x8fc00000 is System RAM there, outside the XNU window and below the
+- * splash framebuffer at 0x90001000. */
+-#define ZAP_PA                  0x8fc00000u
++ * TWRP's kgsl on this phone loads it at 0x8f800000 (System RAM, outside the
++ * XNU window and below the splash framebuffer at 0x90001000). */
++#define ZAP_PA                  0x8f800000u
+ #define ZAP_SIZE                0x00100000u
+ #define GPU_PAS_ID              13
+ /* Crypto engine for TZ's signature check (FDT scm_core/iface/bus clocks):
+@@ -519,6 +519,14 @@
+     bool bimc_gfx = branch_on(gcc, CBCR_BIMC_GFX);
+     printf("OCEAN GPU: cx_gdsc %s ahb %s bimc_gpu %s bimc_gfx %s\n", cx ? "on" : "TIMEOUT",
+         ahb ? "on" : "OFF", bimc_gpu ? "on" : "OFF", bimc_gfx ? "on" : "OFF");
++    /* test34: GPU SMMU and RBBM reads hung. Traced TWRP's kgsl on this phone:
++     * after every gdsc_oxili_cx enable the SMMU driver (qcom,tz-device-id
++     * "GPU") calls MP restore_sec_cfg (SMC 0x42000c02, sec_id 0x12, spare 0)
++     * before the LDO and GX come up; the GPU's access control is lost on
++     * each CX collapse. */
++    uint64_t sec_r1 = 0;
++    int64_t sec = scm_call(0x0c, 0x02, 2, 0x12, 0, 0, &sec_r1);
++    printf("OCEAN GPU: restore_sec_cfg(GPU) -> %lld/%llx\n", sec, sec_r1);
+     pause_s(3);
+ 
+     /* 3. gfx3d = 133.33 MHz (gpll0_main_div2_mm / 3), root forced on for the
