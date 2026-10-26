@@ -1,0 +1,223 @@
+diff --git a/bsd/dev/ocean_gpu.c b/bsd/dev/ocean_gpu.c
+--- a/bsd/dev/ocean_gpu.c
++++ b/bsd/dev/ocean_gpu.c
+@@ -101,6 +101,20 @@
+ #define CP_NOP                  0x10
+ #define CP_MEM_WRITE            0x3d
+ #define CP_ME_INIT              0x48
++#define CP_SET_SECURE_MODE      0x66
++
++/* Zap shader (FDT qcom,kgsl-hyp: pil-tz-generic, pas-id 13, firmware
++ * a506_zap, memory-region gpu_region = CMA in 0x80000000..0x90000000).
++ * 0x8fc00000 is System RAM there, outside the XNU window and below the
++ * splash framebuffer at 0x90001000. */
++#define ZAP_PA                  0x8fc00000u
++#define ZAP_SIZE                0x00100000u
++#define GPU_PAS_ID              13
++/* Crypto engine for TZ's signature check (FDT scm_core/iface/bus clocks):
++ * APCS_CLOCK_BRANCH_ENA_VOTE bits 0..2, crypto RCG 0x16004 at 80 MHz. */
++#define APCS_VOTE               0x45004u
++#define CRYPTO_CMD              0x16004u
++#define CRYPTO_CFG              0x16008u
+ 
+ static int gpu_chan;
+ 
+@@ -258,6 +272,113 @@
+     return pa;
+ }
+ 
++/*
++ * Qualcomm SCM call, ARM SMCCC (mainline qcom_scm-smc.c, as ios-sailfish
++ * 0130): standard call, SMC64, SIP owner, fn (svc << 8) | cmd, x1 =
++ * arginfo, x2-x4 = args. INTERRUPTED (1) is resumed with x0 = 1 and the
++ * returned x6; EBUSY (-12) is retried. Returns x0 (0 = ok), *r1 = x1.
++ */
++static int64_t scm_call(uint32_t svc, uint32_t cmd, uint32_t arginfo, uint64_t a, uint64_t b,
++    uint64_t c, uint64_t *r1) {
++    uint64_t fn = (1ull << 30) | (2ull << 24) | ((uint64_t)svc << 8) | cmd;
++    for (int busy = 0;; busy++) {
++        uint64_t a0 = fn, a6 = 0;
++        register uint64_t x0 __asm__("x0"), x1 __asm__("x1"), x2 __asm__("x2"), x3 __asm__("x3");
++        register uint64_t x4 __asm__("x4"), x5 __asm__("x5"), x6 __asm__("x6"), x7 __asm__("x7");
++        do {
++            x0 = a0; x1 = arginfo; x2 = a; x3 = b; x4 = c; x5 = 0; x6 = a6; x7 = 0;
++            __asm__ volatile("smc #0"
++                : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++                :
++                : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
++            a0 = 1;
++            a6 = x6;
++        } while (x0 == 1);
++        if ((int64_t)x0 != -12 || busy >= 20) {
++            if (r1) { *r1 = x1; }
++            return (int64_t)x0;
++        }
++        delay(30000);
++    }
++}
++
++static void crypto_clocks(vm_offset_t gcc) {
++    wr(gcc, CRYPTO_CFG, (1u << 8) | 19u);           /* GPLL0 / 10 = 80 MHz */
++    wr(gcc, CRYPTO_CMD, rd(gcc, CRYPTO_CMD) | 1u);
++    bool rcg = poll(gcc, CRYPTO_CMD, 1u, 0, 10);
++    wr(gcc, APCS_VOTE, rd(gcc, APCS_VOTE) | 7u);    /* crypto ahb, axi, core */
++    delay(100);
++    printf("OCEAN GPU: crypto clocks rcg %s cmd %08x vote %08x cbcr %08x %08x %08x\n",
++        rcg ? "updated" : "TIMEOUT", rd(gcc, CRYPTO_CMD), rd(gcc, APCS_VOTE),
++        rd(gcc, 0x1601c), rd(gcc, 0x16020), rd(gcc, 0x16024));
++}
++
++/* ELF32 program header */
++struct zap_phdr {
++    uint32_t type, offset, vaddr, paddr, filesz, memsz, flags, align;
++};
++
++/*
++ * mainline qcom_mdt_load + qcom_scm_pas_auth_and_reset for the split
++ * a506_zap: metadata = the .mdt (ELF header, phdrs, hash segment), one
++ * loadable segment (.b02, ADT zap-seg) placed at the carveout start.
++ */
++static bool zap_load(vm_offset_t gcc) {
++    DTEntry node;
++    void const *mdt, *seg;
++    unsigned int mdt_len, seg_len;
++    if (SecureDTLookupEntry(NULL, "/ocean-gpu", &node) != kSuccess ||
++        SecureDTGetProperty(node, "zap-mdt", &mdt, &mdt_len) != kSuccess ||
++        SecureDTGetProperty(node, "zap-seg", &seg, &seg_len) != kSuccess || mdt_len < 0x34) {
++        printf("OCEAN GPU: no zap-mdt/zap-seg in the ADT\n");
++        return false;
++    }
++    const uint8_t *m = (const uint8_t *)mdt;
++    uint32_t phoff = *(const uint32_t *)(m + 0x1c);
++    uint16_t phnum = *(const uint16_t *)(m + 0x2c);
++    uint32_t lo = ~0u, hi = 0, filesz = 0, memsz = 0, nload = 0;
++    for (uint32_t i = 0; i < phnum && phoff + (i + 1) * 32 <= mdt_len; i++) {
++        const struct zap_phdr *ph = (const struct zap_phdr *)(m + phoff + i * 32);
++        /* PT_LOAD, not the hash segment (flags 26:24 == 2), not empty */
++        if (ph->type != 1 || ((ph->flags >> 24) & 7) == 2 || ph->memsz == 0) { continue; }
++        nload++;
++        lo = ph->paddr;
++        hi = (ph->paddr + ph->memsz + 0xfff) & ~0xfffu;
++        filesz = ph->filesz;
++        memsz = ph->memsz;
++    }
++    if (nload != 1 || filesz != seg_len || memsz > ZAP_SIZE) {
++        printf("OCEAN GPU: zap layout unexpected: %u loadable, filesz %u seg %u memsz %u\n",
++            nload, filesz, seg_len, memsz);
++        return false;
++    }
++    vm_offset_t meta_va;
++    uint64_t meta = gpu_alloc(mdt_len, &meta_va);
++    if (!meta) { return false; }
++    memcpy((void *)meta_va, mdt, mdt_len);
++    flush_dcache64((addr64_t)meta, (unsigned)round_page(mdt_len), TRUE);
++    crypto_clocks(gcc);
++    uint64_t r1 = 0;
++    /* PAS_INIT_IMAGE (svc 2 cmd 1): pas id VAL, metadata RW */
++    int64_t r = scm_call(2, 1, 2u | (2u << 6), GPU_PAS_ID, meta, 0, &r1);
++    printf("OCEAN GPU: zap init_image (meta %llx, %u bytes) -> %lld/%llx\n", meta, mdt_len, r, r1);
++    if (r != 0 || r1 != 0) { return false; }
++    /* PAS_MEM_SETUP (svc 2 cmd 2): pas id, base, size */
++    r = scm_call(2, 2, 3, GPU_PAS_ID, ZAP_PA, hi - lo, &r1);
++    printf("OCEAN GPU: zap mem_setup %x + %x -> %lld/%llx\n", ZAP_PA, hi - lo, r, r1);
++    if (r != 0 || r1 != 0) { return false; }
++    vm_offset_t zap = ml_io_map(ZAP_PA, ZAP_SIZE);
++    if (!zap) { return false; }
++    const uint32_t *src = (const uint32_t *)seg;
++    for (uint32_t off = 0; off < ((memsz + 3) & ~3u); off += 4) {
++        wr(zap, off, off < seg_len ? src[off / 4] : 0);
++    }
++    /* PAS_AUTH_AND_RESET (svc 2 cmd 5): pas id */
++    r = scm_call(2, 5, 1, GPU_PAS_ID, 0, 0, &r1);
++    printf("OCEAN GPU: zap auth_and_reset -> %lld/%llx\n", r, r1);
++    return r == 0 && r1 == 0;
++}
++
+ static void cp_state(vm_offset_t gpu, const char *when) {
+     printf("OCEAN GPU: %s RBBM_STATUS %08x RPTR %u WPTR %u CP_HW_FAULT %08x CP_INT %08x "
+         "RBBM_INT %08x TRUST %08x\n",
+@@ -267,7 +388,7 @@
+ }
+ 
+ /* Stage 2: command processor. */
+-static void cp_test(vm_offset_t gpu) {
++static void cp_test(vm_offset_t gpu, vm_offset_t gcc, int stages) {
+     uint32_t pm4_len = 0, pfp_len = 0;
+     uint64_t pm4 = ucode("pm4", &pm4_len), pfp = ucode("pfp", &pfp_len);
+     if (!pm4 || !pfp) {
+@@ -347,6 +468,34 @@
+     printf("OCEAN GPU: scratch %08x -> %s\n", got,
+         got == 0xc0ffee01 ? "CP_MEM_WRITE landed: GPU WRITES MEMORY" :
+         "no write (expected while in secure mode)");
++    if (stages < 3 || ms >= 200) { return; }
++
++    /* Stage 3: zap shader through TZ, then leave secure mode. */
++    pause_s(3);
++    if (!zap_load(gcc)) {
++        printf("OCEAN GPU: no zap shader, the GPU stays secure\n");
++        return;
++    }
++    pause_s(2);
++    uint32_t start = n;
++    rb[n++] = pkt7(CP_SET_SECURE_MODE, 1);
++    rb[n++] = 0;
++    rb[n++] = pkt7(CP_MEM_WRITE, 3);
++    rb[n++] = (uint32_t)(scratch + 64);
++    rb[n++] = (uint32_t)((scratch + 64) >> 32);
++    rb[n++] = 0xc0ffee02;
++    rb[n++] = pkt7(CP_NOP, 0);
++    flush_dcache64((addr64_t)(ring + start * 4), (n - start) * 4, TRUE);
++    gw(gpu, R_CP_RB_WPTR, n);
++    for (ms = 0; ms < 200 && gr(gpu, R_CP_RB_RPTR) != n; ms++) {
++        delay(1000);
++    }
++    delay(1000);
++    flush_dcache64((addr64_t)scratch + 64, 64, TRUE);
++    uint32_t got2 = *(volatile uint32_t *)(scratch_va + 64);
++    cp_state(gpu, ms < 200 ? "after CP_SET_SECURE_MODE 0:" : "secure-mode switch NOT consumed (200 ms):");
++    printf("OCEAN GPU: scratch+64 %08x -> %s\n", got2,
++        got2 == 0xc0ffee02 ? "GPU OUT OF SECURE MODE AND WRITING" : "no write");
+ }
+ 
+ static void gpu_thread(void *arg, __unused wait_result_t wr_result) {
+@@ -411,7 +560,12 @@
+         printf("OCEAN GPU: not all on, no GPU register access\n");
+         return;
+     }
+-    pause_s(3);
++    /* test31: GX came up, then the phone froze within seconds, before the
++     * first register read was logged. Stay powered for 5 s first, then read
++     * one register per step with the step logged 3 s ahead, so the log
++     * flush (every 2 s) shows which access, if any, hangs. */
++    printf("OCEAN GPU: GPU powered, holding 5 s before register reads\n");
++    pause_s(5);
+ 
+     /* 5. GPU registers. */
+     vm_offset_t gpu = ml_io_map(GPU_PA, 0x40000);
+@@ -419,17 +573,23 @@
+         printf("OCEAN GPU: GPU map failed\n");
+         return;
+     }
+-    printf("OCEAN GPU: reading GPU registers\n");
+-    uint32_t vbif = rd(gpu, 0x3000 * 4);
++    printf("OCEAN GPU: next: RBBM_STATUS (core register block)\n");
++    pause_s(3);
+     uint32_t status = rd(gpu, 0x4f5 * 4);
++    printf("OCEAN GPU: RBBM_STATUS %08x; next: always-on counter\n", status);
++    pause_s(3);
+     uint32_t aon0 = rd(gpu, 0x4d2 * 4);
+     delay(1000);
+     uint32_t aon1 = rd(gpu, 0x4d2 * 4);
++    printf("OCEAN GPU: ALWAYSON %08x -> %08x (%s); next: VBIF_VERSION\n", aon0, aon1,
++        aon1 != aon0 ? "counting: GPU alive" : "not counting");
++    pause_s(3);
++    uint32_t vbif = rd(gpu, 0x3000 * 4);
+     printf("OCEAN GPU: VBIF_VERSION %08x RBBM_STATUS %08x ALWAYSON %08x -> %08x (%s)\n",
+         vbif, status, aon0, aon1, aon1 != aon0 ? "counting: GPU alive" : "not counting");
+     if (stages >= 2 && aon1 != aon0) {
+         pause_s(3);
+-        cp_test(gpu);
++        cp_test(gpu, gcc, stages);
+     }
+ }
+ 
