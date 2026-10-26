@@ -1,0 +1,41 @@
+name: ocean-mesa
+
+# Mesa (freedreno + softpipe, OSMesa) and ocean_gltest for the Moto's iOS
+# userland; see mesa/build-mesa-ios.sh. Separate from ocean-xnu so a Mesa
+# build never cancels a kernel build.
+on:
+  workflow_dispatch:
+  push:
+    branches: [ocean-xnu-entry]
+    paths:
+      - "mesa/**"
+      - ".github/workflows/ocean-mesa.yml"
+
+concurrency:
+  group: ocean-mesa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mesa:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tools
+        run: brew install bison flex
+      - name: Build
+        run: bash mesa/build-mesa-ios.sh
+        env:
+          B: ${{ runner.temp }}/mesa-build
+          OUT: ${{ github.workspace }}/mesa-out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mesa-ios
+          path: mesa-out/
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: mesa-logs
+          path: |
+            ${{ runner.temp }}/mesa-build/build/meson-logs/
+          if-no-files-found: ignore
