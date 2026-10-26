@@ -1,0 +1,35 @@
+diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
+--- a/bsd/dev/ocean_sdhci.c
++++ b/bsd/dev/ocean_sdhci.c
+@@ -729,16 +729,26 @@
+     if (~crc_step(0xffffffffU,header,hsize) != hcrc) { return EIO; }
+     uint64_t table = le64(header+72);
+     unsigned int count = le32(header+80), entsize = le32(header+84);
+-    uint32_t expected = le32(header+88), crc = 0xffffffffU;
++    uint32_t expected = le32(header+88), crc = 0xffffffffU, layout = 0xffffffffU;
+     if (!count || count > 256 || entsize != 128 || table < 2 ||
+         table >= ocean_sectors || (count + 3) / 4 > ocean_sectors-table) { return EINVAL; }
++    /* The bootloader rewrites the A/B slot flags (attribute bits 48-63:
++     * priority, active, retry count, successful, unbootable) when a slot is
++     * flashed or booted normally, which changes both GPT CRCs. Match the
++     * recovery GPT with those bytes and the two CRC fields left out. */
++    memset(header+88,0,4);
++    uint32_t hlayout = ~crc_step(0xffffffffU,header,hsize);
+     for (unsigned int i = 0; i < (count + 3)/4; i++) {
+         error = read_sector(table+i,sector);
+         if (error) { return error; }
+-        crc = crc_step(crc,sector,MIN(512U,(count-i*4)*128));
+-    }
+-    printf("OCEAN SDHCI: GPT header CRC=0x%08x table CRC=0x%08x entries=%u\n",hcrc,~crc,count);
+-    if (~crc != expected || hcrc != 0x64dfe706U || expected != 0x0c4426e0U) { return EIO; }
++        unsigned int len = MIN(512U,(count-i*4)*128);
++        crc = crc_step(crc,sector,len);
++        for (unsigned int j = 0; j < len; j += 128) { sector[j+54] = 0; sector[j+55] = 0; }
++        layout = crc_step(layout,sector,len);
++    }
++    printf("OCEAN SDHCI: GPT header CRC=0x%08x table CRC=0x%08x entries=%u layout=0x%08x/0x%08x\n",
++        hcrc,~crc,count,hlayout,~layout);
++    if (~crc != expected || hlayout != 0x13c35a46U || ~layout != 0x7eeddb12U) { return EIO; }
+     printf("OCEAN SDHCI: sector reads match recovery GPT; checking for HFS\n");
+     for (unsigned int i = 0; i < count; i++) {
+         if ((i & 3) == 0) {
