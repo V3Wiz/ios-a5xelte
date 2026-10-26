@@ -1,0 +1,37 @@
+diff --git a/iokit/Kernel/arm/OceanGPU.cpp b/iokit/Kernel/arm/OceanGPU.cpp
+--- a/iokit/Kernel/arm/OceanGPU.cpp
++++ b/iokit/Kernel/arm/OceanGPU.cpp
+@@ -285,6 +285,7 @@
+ 	uint32_t                fSubmits;
+ 	uint32_t                fStrangers;
+ 	uint32_t                fNewLogged;
++	uint32_t                fPrepLogged;
+ 	struct gpu_left         fLeft[GPU_LEFT];
+ 	uint32_t                fLeftCount;
+ 
+@@ -652,6 +653,25 @@
+ 			ret = kIOReturnBusy;
+ 		}
+ 		ocean_gpu_check("cpu prep");
++		/* What the GPU left in the buffer the program is about to read: it
++		 * tells a picture that was never drawn from one that is not read back. */
++		if (ret == kIOReturnSuccess && fPrepLogged < 32 && (b = buffer(r.cpuPrep.handle)) != NULL) {
++			const volatile uint32_t *word = (const volatile uint32_t *)b->memory->getBytesNoCopy();
++			uint64_t words = b->size / 4, nonzero = 0, first = words;
++			uint32_t sum = 0;
++
++			for (uint64_t i = 0; word != NULL && i < words; i++) {
++				uint32_t v = word[i];
++
++				sum = sum * 31 + v;
++				if (v != 0 && nonzero++ == 0) {
++					first = i;
++				}
++			}
++			fPrepLogged++;
++			IOLog("OceanGPU: program reads buffer %u (op %#x, %llu bytes): %llu words not zero, first [%llu] %08x, sum %08x\n",
++			    r.cpuPrep.handle, r.cpuPrep.op, b->size, nonzero, first, first < words ? word[first] : 0, sum);
++		}
+ 		IOLockUnlock(gGPULock);
+ 		break;
+ 	case kMsmGemSubmit:
