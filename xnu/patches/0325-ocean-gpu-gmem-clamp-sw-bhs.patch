@@ -1,0 +1,80 @@
+diff --git a/bsd/dev/ocean_gpu.c b/bsd/dev/ocean_gpu.c
+--- a/bsd/dev/ocean_gpu.c
++++ b/bsd/dev/ocean_gpu.c
+@@ -59,6 +59,7 @@
+ #define CBCR_TIMER      0x59040u
+ #define CBCR_AON        0x59044u
+ #define CX_GDSC         0x5904cu
++#define GX_DOMAIN_MISC  0x5b00cu        /* bit 0: OXILI_GMEM_CLAMP_IO */
+ 
+ /* msm_gfx_ldo.c */
+ #define LDO_ATEST       0x00u
+@@ -148,6 +149,45 @@
+         rd(ldo, LDO_CFG0));
+ }
+ 
++/*
++ * Fallback, msm_gfx_ldo switch_mode_to_bhs: power the BHS up under SW
++ * control (fake ack to the GDSC meanwhile), wait for BHS_EN_REST_ACK, then
++ * expose it to the GDSC again. Returns the PWRSWITCH status seen.
++ */
++static uint32_t gfx_ldo_sw_bhs(vm_offset_t ldo) {
++    uint32_t ctl = rd(ldo, LDO_PWRSWITCH), status = 0;
++    ctl |= 1u << 8;                     /* ACK_SW_OVR: fake ack to the GDSC */
++    wr(ldo, LDO_PWRSWITCH, ctl);
++    ctl &= ~(1u << 9);                  /* power source: BHS */
++    wr(ldo, LDO_PWRSWITCH, ctl);
++    ctl &= ~(1u << 5);                  /* LDO stays on */
++    wr(ldo, LDO_PWRSWITCH, ctl);
++    ctl |= 1u << 4;                     /* LDO under SW control */
++    wr(ldo, LDO_PWRSWITCH, ctl);
++    ctl |= 1u << 0;                     /* BHS under SW control */
++    wr(ldo, LDO_PWRSWITCH, ctl);
++    ctl |= 1u << 1;                     /* BHS_EN_FEW */
++    wr(ldo, LDO_PWRSWITCH, ctl);
++    ctl |= 1u << 2;                     /* BHS_EN_REST */
++    wr(ldo, LDO_PWRSWITCH, ctl);
++    for (unsigned i = 0; i < 500; i++) {
++        status = rd(ldo, LDO_PWR_STATUS);
++        if (status & 2u) { break; }     /* BHS_EN_REST_ACK */
++        delay(10);
++    }
++    ctl |= 1u << 6;                     /* bypass the LDO */
++    wr(ldo, LDO_PWRSWITCH, ctl);
++    ctl |= 1u << 5;                     /* pull the LDO down */
++    wr(ldo, LDO_PWRSWITCH, ctl);
++    ctl &= ~(1u << 8);                  /* expose the BHS to the GDSC */
++    wr(ldo, LDO_PWRSWITCH, ctl);
++    ctl &= ~1u;
++    wr(ldo, LDO_PWRSWITCH, ctl);
++    ctl &= ~(1u << 30);                 /* CPR on in BHS mode */
++    wr(ldo, LDO_PWRSWITCH, ctl);
++    return status;
++}
++
+ /* msm_gfx_ldo_init + enable_bhs_mode for MSM8953 (ops_type CORNER). */
+ static void gfx_ldo_bhs(vm_offset_t ldo) {
+     uint32_t ctl = rd(ldo, LDO_PWRSWITCH);
+@@ -345,9 +385,21 @@
+ 
+     /* 4. GFX power switch in BHS mode, then the GX GDSC, the core branch
+      * (retain mem/periph), timer and AON. */
++    /* Motorola msm_gcc_gfx_probe: Oxili GMEM in the GX rail, clear its clamp. */
++    uint32_t misc = rd(gcc, GX_DOMAIN_MISC);
++    wr(gcc, GX_DOMAIN_MISC, misc & ~1u);
+     gfx_ldo_bhs(ldo);
+-    printf("OCEAN GPU: gfx ldo -> ctl %08x status %08x\n", rd(ldo, LDO_PWRSWITCH), rd(ldo, LDO_PWR_STATUS));
++    printf("OCEAN GPU: gx_domain_misc %08x -> %08x, gfx ldo -> ctl %08x status %08x\n",
++        misc, rd(gcc, GX_DOMAIN_MISC), rd(ldo, LDO_PWRSWITCH), rd(ldo, LDO_PWR_STATUS));
+     bool gx = gdsc_on(gcc, GX_GDSC);
++    if (!gx) {
++        printf("OCEAN GPU: gx_gdsc %08x TIMEOUT with the BHS under GDSC control, trying SW BHS\n",
++            rd(gcc, GX_GDSC));
++        uint32_t ack = gfx_ldo_sw_bhs(ldo);
++        printf("OCEAN GPU: SW BHS status %08x (%s) ctl %08x\n", ack,
++            (ack & 2u) ? "BHS_EN_REST_ACK" : "no ack", rd(ldo, LDO_PWRSWITCH));
++        gx = gdsc_on(gcc, GX_GDSC);
++    }
+     wr(gcc, CBCR_GFX3D, rd(gcc, CBCR_GFX3D) | (1u << 14) | (1u << 13));
+     bool core = branch_on(gcc, CBCR_GFX3D);
+     bool timer = branch_on(gcc, CBCR_TIMER);
