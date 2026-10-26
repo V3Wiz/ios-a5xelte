@@ -1,0 +1,377 @@
+diff --git a/bsd/dev/ocean_gpu.c b/bsd/dev/ocean_gpu.c
+--- a/bsd/dev/ocean_gpu.c
++++ b/bsd/dev/ocean_gpu.c
+@@ -1,19 +1,27 @@
+-/* OCEAN Adreno 506 power-up probe (SDM632), boot-arg ocean_gpu=1.
++/* OCEAN Adreno 506 bring-up (SDM632), boot-arg ocean_gpu=N.
+  *
+- * Step 1 of GPU acceleration, after ios-sailfish's Adreno 530 probe (0119):
+- * power and clock the GPU and read its registers. SDM632 differences, from
+- * Motorola's clock-gcc-8953.c / msm-clocks-hwio-8953.h and the live FDT:
+- *   - No separate GFX rail: oxili_gx's parent is the msm8953-gfx-ldo, which
+- *     maps every corner to bypass, so the GPU runs from VDD_CX (already on).
++ * After ios-sailfish's Adreno 530 steps (0119 power probe, 0120 CP test),
++ * with SDM632 specifics from Motorola's clock-gcc-8953.c, msm_gfx_ldo.c,
++ * msm-clocks-hwio-8953.h and the live FDT:
++ *   - The GX GDSC sits behind the msm8953-gfx-ldo power switch (0x185f000),
++ *     which every corner runs in BHS (bypass) mode from VDD_CX. test29: GX
++ *     timed out with that block never initialised (registers all zero), so
++ *     stage 1 first does msm_gfx_ldo_init (clear the IO clamp, CPR auto
++ *     bypass, the MSM8953 init values) and enable_bhs_mode.
+  *   - GPU clocks and GDSCs are in GCC (0x1800000): GFX3D RCG 0x59000 (CFG
+  *     0x59004), branches oxili_gfx3d 0x59020, oxili_ahb 0x59028, bimc_gpu
+  *     0x59030, bimc_gfx 0x59034, oxili_timer 0x59040, oxili_aon 0x59044;
+- *     GDSCs oxili_gx 0x5901c (needs the gfx3d root forced on), oxili_cx
+- *     0x5904c.
+- *   - gfx3d at 133.33 MHz = gpll0_main_div2_mm (source 5) / 3, the lowest
+- *     GPLL-sourced level in Motorola's frequency table.
+- *   - GPU registers at 0x1c00000 (chip id 5.0.6.0), a5xx.xml dword offsets:
+- *     VBIF_VERSION 0x3000, RBBM_STATUS 0x4f5, RBBM_ALWAYSON_COUNTER_LO 0x4d2.
++ *     GDSCs oxili_gx 0x5901c (gfx3d root forced on), oxili_cx 0x5904c.
++ *   - gfx3d at 133.33 MHz = gpll0_main_div2_mm (source 5) / 3.
++ *   - GPU registers at 0x1c00000 (chip id 5.0.6.0), its SMMU (kgsl-smmu-v2)
++ *     at 0x1c40000; a5xx.xml dword offsets.
++ * ocean_gpu=1: power up and read the GPU. ocean_gpu=2: also the command
++ * processor test: Adreno 5xx microcode from the ADT (/ocean-gpu pm4, pfp:
++ * the phone's a530_pm4.fw / a530_pfp.fw without their 4-byte header),
++ * SMMU in bypass, a ring with CP_ME_INIT (A506 settings from mainline
++ * a5xx_hw_init / a5xx_me_init) and a CP_MEM_WRITE. Until a zap shader takes
++ * the GPU out of secure mode the write is not expected to land; the ring
++ * read pointer advancing shows the CP runs.
+  * Starts 20 s after the root mounts, with 3 s pauses between stages so the
+  * persistent log (flushed every 2 s) holds the last good stage if one hangs.
+  */
+@@ -23,9 +31,14 @@
+ #include <kern/clock.h>
+ #include <kern/sched_prim.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ #include <libkern/libkern.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t map, addr64_t va);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern int hz;
+@@ -33,6 +46,7 @@
+ 
+ #define GCC_PA          0x01800000u
+ #define GPU_PA          0x01c00000u
++#define SMMU_PA         0x01c40000u
+ #define GFX_LDO_PA      0x0185f000u
+ 
+ #define GFX3D_CMD       0x59000u
+@@ -46,6 +60,47 @@
+ #define CBCR_AON        0x59044u
+ #define CX_GDSC         0x5904cu
+ 
++/* msm_gfx_ldo.c */
++#define LDO_ATEST       0x00u
++#define LDO_CFG0        0x04u
++#define LDO_CFG1        0x08u
++#define LDO_CFG2        0x0cu
++#define LDO_VREF_TEST   0x14u
++#define LDO_PWRSWITCH   0x1cu
++#define LDO_PWR_STATUS  0x28u
++
++/* a5xx.xml dword offsets */
++#define R_CP_RB_BASE            0x0800
++#define R_CP_RB_CNTL            0x0802
++#define R_CP_RB_RPTR            0x0806
++#define R_CP_RB_WPTR            0x0807
++#define R_CP_ROQ_THRESHOLDS_1   0x081f
++#define R_CP_ROQ_THRESHOLDS_2   0x0820
++#define R_CP_MEQ_THRESHOLDS     0x0825
++#define R_CP_MERCIU_SIZE        0x0826
++#define R_CP_PFP_ME_CNTL        0x0832
++#define R_CP_CHICKEN_DBG        0x0833
++#define R_CP_PFP_INSTR_BASE     0x0835
++#define R_CP_ME_INSTR_BASE      0x0838
++#define R_CP_ADDR_MODE_CNTL     0x0860
++#define R_CP_INTERRUPT_STATUS   0x0b18
++#define R_CP_HW_FAULT           0x0b1a
++#define R_RBBM_AHB_CNTL0        0x0093
++#define R_RBBM_AHB_CNTL1        0x0094
++#define R_RBBM_AHB_CNTL2        0x0095
++#define R_RBBM_INT_0_STATUS     0x04e1
++#define R_RBBM_STATUS           0x04f5
++#define R_VBIF_RR_QOS_ARB       0x3049
++#define R_SECVID_TRUST_CNTL     0xf400
++#define R_SECVID_TSB_BASE       0xf800
++#define R_SECVID_TSB_SIZE       0xf802
++#define R_SECVID_TSB_CNTL       0xf803
++#define R_SECVID_TSB_ADDR_MODE  0xf810
++/* adreno_pm4.xml opcodes */
++#define CP_NOP                  0x10
++#define CP_MEM_WRITE            0x3d
++#define CP_ME_INIT              0x48
++
+ static int gpu_chan;
+ 
+ static void pause_s(int secs) {
+@@ -86,13 +141,176 @@
+ 
+ static void dump(vm_offset_t gcc, vm_offset_t ldo, const char *when) {
+     printf("OCEAN GPU: %s cx_gdsc %08x gx_gdsc %08x gfx3d_rcg %08x/%08x gfx3d %08x ahb %08x "
+-        "bimc_gpu %08x bimc_gfx %08x timer %08x aon %08x ldo %08x %08x %08x\n",
++        "bimc_gpu %08x bimc_gfx %08x timer %08x aon %08x ldo ctl %08x status %08x cfg0 %08x\n",
+         when, rd(gcc, CX_GDSC), rd(gcc, GX_GDSC), rd(gcc, GFX3D_CMD), rd(gcc, GFX3D_CFG),
+         rd(gcc, CBCR_GFX3D), rd(gcc, CBCR_AHB), rd(gcc, CBCR_BIMC_GPU), rd(gcc, CBCR_BIMC_GFX),
+-        rd(gcc, CBCR_TIMER), rd(gcc, CBCR_AON), rd(ldo, 0x0), rd(ldo, 0x4), rd(ldo, 0x8));
+-}
+-
+-static void gpu_thread(__unused void *arg, __unused wait_result_t wr_result) {
++        rd(gcc, CBCR_TIMER), rd(gcc, CBCR_AON), rd(ldo, LDO_PWRSWITCH), rd(ldo, LDO_PWR_STATUS),
++        rd(ldo, LDO_CFG0));
++}
++
++/* msm_gfx_ldo_init + enable_bhs_mode for MSM8953 (ops_type CORNER). */
++static void gfx_ldo_bhs(vm_offset_t ldo) {
++    uint32_t ctl = rd(ldo, LDO_PWRSWITCH);
++    ctl &= ~(1u << 31);                 /* LDO_CLAMP_IO */
++    ctl |= 1u << 29;                    /* EN_LDOAP_CTRL_CPR */
++    wr(ldo, LDO_PWRSWITCH, ctl);
++    wr(ldo, LDO_ATEST, 0x00000203);
++    wr(ldo, LDO_CFG0, 0x05008600);
++    wr(ldo, LDO_CFG1, 0x00000000);
++    wr(ldo, LDO_CFG2, 0x0000c3fc);
++    wr(ldo, LDO_VREF_TEST, 0x004b1102);
++    ctl |= 1u << 4;                     /* LDO under SW control */
++    wr(ldo, LDO_PWRSWITCH, ctl);
++    ctl &= ~(1u << 9);                  /* power source: BHS */
++    wr(ldo, LDO_PWRSWITCH, ctl);
++    ctl &= ~(1u << 30);                 /* GFX CPR not bypassed */
++    wr(ldo, LDO_PWRSWITCH, ctl);
++    ctl &= ~(1u << 1);                  /* BHS control signals to the GDSC */
++    wr(ldo, LDO_PWRSWITCH, ctl);
++    ctl &= ~(1u << 2);
++    wr(ldo, LDO_PWRSWITCH, ctl);
++    ctl &= ~1u;                         /* BHS under GDSC control */
++    wr(ldo, LDO_PWRSWITCH, ctl);
++}
++
++static uint32_t parity(uint32_t v) {
++    return (0x9669u >> (0xfu & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^ (v >> 16) ^
++        (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1u;
++}
++
++/* msm_ringbuffer OUT_PKT7 header */
++static uint32_t pkt7(uint32_t op, uint32_t cnt) {
++    return (7u << 28) | cnt | (parity(cnt) << 15) | ((op & 0x7fu) << 16) | (parity(op) << 23);
++}
++
++static void gw(vm_offset_t gpu, uint32_t reg, uint32_t v) { wr(gpu, reg * 4, v); }
++static uint32_t gr(vm_offset_t gpu, uint32_t reg) { return rd(gpu, reg * 4); }
++static void gw64(vm_offset_t gpu, uint32_t reg, uint64_t v) {
++    gw(gpu, reg, (uint32_t)v);
++    gw(gpu, reg + 1, (uint32_t)(v >> 32));
++}
++
++/* Physically contiguous, zeroed kernel memory for the GPU; returns its PA. */
++static uint64_t gpu_alloc(vm_size_t size, vm_offset_t *va) {
++    size = round_page(size);
++    if (kmem_alloc_contig(kernel_map, va, size, PAGE_MASK, 0, 0,
++        KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++        return 0;
++    }
++    return ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)*va));
++}
++
++/* Microcode from the ADT, copied into GPU-visible contiguous memory. */
++static uint64_t ucode(const char *name, uint32_t *len) {
++    DTEntry node;
++    void const *data;
++    unsigned int size;
++    if (SecureDTLookupEntry(NULL, "/ocean-gpu", &node) != kSuccess ||
++        SecureDTGetProperty(node, name, &data, &size) != kSuccess || size < 64) {
++        return 0;
++    }
++    vm_offset_t va;
++    uint64_t pa = gpu_alloc(size, &va);
++    if (!pa) { return 0; }
++    memcpy((void *)va, data, size);
++    flush_dcache64((addr64_t)pa, size, TRUE);
++    *len = size;
++    return pa;
++}
++
++static void cp_state(vm_offset_t gpu, const char *when) {
++    printf("OCEAN GPU: %s RBBM_STATUS %08x RPTR %u WPTR %u CP_HW_FAULT %08x CP_INT %08x "
++        "RBBM_INT %08x TRUST %08x\n",
++        when, gr(gpu, R_RBBM_STATUS), gr(gpu, R_CP_RB_RPTR), gr(gpu, R_CP_RB_WPTR),
++        gr(gpu, R_CP_HW_FAULT), gr(gpu, R_CP_INTERRUPT_STATUS), gr(gpu, R_RBBM_INT_0_STATUS),
++        gr(gpu, R_SECVID_TRUST_CNTL));
++}
++
++/* Stage 2: command processor. */
++static void cp_test(vm_offset_t gpu) {
++    uint32_t pm4_len = 0, pfp_len = 0;
++    uint64_t pm4 = ucode("pm4", &pm4_len), pfp = ucode("pfp", &pfp_len);
++    if (!pm4 || !pfp) {
++        printf("OCEAN GPU: no /ocean-gpu pm4/pfp microcode in the ADT, no CP test\n");
++        return;
++    }
++    vm_offset_t smmu = ml_io_map(SMMU_PA, 0x10000);
++    if (!smmu) { return; }
++    uint32_t cr0 = rd(smmu, 0);
++    printf("OCEAN GPU: SMMU sCR0 %08x IDR0 %08x IDR1 %08x SMR0 %08x S2CR0 %08x CB0 SCTLR %08x\n",
++        cr0, rd(smmu, 0x20), rd(smmu, 0x24), rd(smmu, 0x800), rd(smmu, 0xc00), rd(smmu, 0x8000));
++    if (!(cr0 & 1u)) {
++        /* Not in bypass: CLIENTPD = 1 so the GPU uses physical addresses. */
++        wr(smmu, 0, cr0 | 1u);
++        printf("OCEAN GPU: SMMU sCR0 -> %08x\n", rd(smmu, 0));
++    }
++    vm_offset_t ring_va, scratch_va;
++    uint64_t ring = gpu_alloc(16384, &ring_va), scratch = gpu_alloc(PAGE_SIZE, &scratch_va);
++    if (!ring || !scratch) {
++        printf("OCEAN GPU: no ring/scratch memory\n");
++        return;
++    }
++    printf("OCEAN GPU: pm4 %llx (%u) pfp %llx (%u) ring %llx scratch %llx\n",
++        pm4, pm4_len, pfp, pfp_len, ring, scratch);
++    pause_s(3);
++
++    /* Subset of mainline a5xx_hw_init, A506 values. */
++    gw(gpu, R_VBIF_RR_QOS_ARB, 3);
++    gw(gpu, R_RBBM_AHB_CNTL0, 1);
++    gw(gpu, R_CP_MEQ_THRESHOLDS, 0x20);
++    gw(gpu, R_CP_MERCIU_SIZE, 0x400);
++    gw(gpu, R_CP_ROQ_THRESHOLDS_2, 0x40000030);
++    gw(gpu, R_CP_ROQ_THRESHOLDS_1, 0x20100d0a);
++    gw(gpu, R_CP_CHICKEN_DBG, 0x02000000);
++    gw(gpu, R_RBBM_AHB_CNTL1, 0xa6ffffff);
++    gw(gpu, R_RBBM_AHB_CNTL2, 0x3f);
++    gw(gpu, R_SECVID_TSB_CNTL, 0);
++    gw64(gpu, R_SECVID_TSB_BASE, 0);
++    gw(gpu, R_SECVID_TSB_SIZE, 0);
++    gw(gpu, R_CP_ADDR_MODE_CNTL, 1);
++    gw(gpu, R_SECVID_TSB_ADDR_MODE, 1);
++    gw64(gpu, R_CP_ME_INSTR_BASE, pm4);
++    gw64(gpu, R_CP_PFP_INSTR_BASE, pfp);
++    gw64(gpu, R_CP_RB_BASE, ring);
++    /* BUFSZ log2(16 KB / 8) = 11, BLKSZ log2(32 / 8) = 2 (mainline), NO_UPDATE */
++    gw(gpu, R_CP_RB_CNTL, 11u | (2u << 8) | (1u << 27));
++    cp_state(gpu, "before ME start:");
++
++    uint32_t *rb = (uint32_t *)ring_va, n = 0;
++    rb[n++] = pkt7(CP_ME_INIT, 8);
++    rb[n++] = 0x2f;
++    rb[n++] = 0x3;
++    rb[n++] = 0x20000000;
++    rb[n++] = 0;
++    rb[n++] = 0;
++    rb[n++] = 0xb;          /* A506/A530 token-end-sync workaround */
++    rb[n++] = 0;
++    rb[n++] = 0;
++    rb[n++] = pkt7(CP_MEM_WRITE, 3);
++    rb[n++] = (uint32_t)scratch;
++    rb[n++] = (uint32_t)(scratch >> 32);
++    rb[n++] = 0xc0ffee01;
++    rb[n++] = pkt7(CP_NOP, 0);
++    flush_dcache64((addr64_t)ring, 16384, TRUE);
++    flush_dcache64((addr64_t)scratch, PAGE_SIZE, TRUE);
++
++    gw(gpu, R_CP_PFP_ME_CNTL, 0);   /* clear ME_HALT */
++    gw(gpu, R_CP_RB_WPTR, n);
++    unsigned ms;
++    for (ms = 0; ms < 200 && gr(gpu, R_CP_RB_RPTR) != n; ms++) {
++        delay(1000);
++    }
++    delay(1000);
++    flush_dcache64((addr64_t)scratch, 64, TRUE);
++    uint32_t got = *(volatile uint32_t *)scratch_va;
++    cp_state(gpu, ms < 200 ? "ring consumed: COMMAND PROCESSOR RUNS" : "ring NOT consumed (200 ms):");
++    printf("OCEAN GPU: scratch %08x -> %s\n", got,
++        got == 0xc0ffee01 ? "CP_MEM_WRITE landed: GPU WRITES MEMORY" :
++        "no write (expected while in secure mode)");
++}
++
++static void gpu_thread(void *arg, __unused wait_result_t wr_result) {
++    int stages = (int)(uintptr_t)arg;
+     pause_s(20);
+     vm_offset_t gcc = ml_io_map(GCC_PA, 0x80000);
+     vm_offset_t ldo = ml_io_map(GFX_LDO_PA, 0x1000);
+@@ -125,7 +343,10 @@
+         root ? "on" : "OFF", rd(gcc, GFX3D_CMD), rd(gcc, GFX3D_CFG));
+     pause_s(3);
+ 
+-    /* 4. GX GDSC, then the core branch (retain mem/periph), timer and AON. */
++    /* 4. GFX power switch in BHS mode, then the GX GDSC, the core branch
++     * (retain mem/periph), timer and AON. */
++    gfx_ldo_bhs(ldo);
++    printf("OCEAN GPU: gfx ldo -> ctl %08x status %08x\n", rd(ldo, LDO_PWRSWITCH), rd(ldo, LDO_PWR_STATUS));
+     bool gx = gdsc_on(gcc, GX_GDSC);
+     wr(gcc, CBCR_GFX3D, rd(gcc, CBCR_GFX3D) | (1u << 14) | (1u << 13));
+     bool core = branch_on(gcc, CBCR_GFX3D);
+@@ -154,15 +375,44 @@
+     uint32_t aon1 = rd(gpu, 0x4d2 * 4);
+     printf("OCEAN GPU: VBIF_VERSION %08x RBBM_STATUS %08x ALWAYSON %08x -> %08x (%s)\n",
+         vbif, status, aon0, aon1, aon1 != aon0 ? "counting: GPU alive" : "not counting");
++    if (stages >= 2 && aon1 != aon0) {
++        pause_s(3);
++        cp_test(gpu);
++    }
++}
++
++/*
++ * test29 found the Gold cluster (perfcl, MPIDR 0x100..) muxed to source 0,
++ * the 19.2 MHz XO, while the boot cluster runs from source 4 / 1 = GPLL0
++ * (about 800 MHz measured). Move the Gold mux (apcs-c1-rcg-base 0xb011050:
++ * CMD, CFG at +4) to the same GPLL0 setting; 800 MHz is within the Gold
++ * corner the current 870 mV rail already supports. ocean_goldclk=0 skips it.
++ */
++void ocean_cpu_clocks(void);
++void ocean_cpu_clocks(void) {
++    int enabled = 1;
++    PE_parse_boot_argn("ocean_goldclk", &enabled, sizeof(enabled));
++    vm_offset_t apcs = enabled ? ml_io_map(0x0b011000, 0x1000) : 0;
++    if (!apcs) { return; }
++    uint32_t cmd = rd(apcs, 0x50), cfg = rd(apcs, 0x54);
++    if (cfg & 0x71fu) {
++        printf("OCEAN CPU: Gold mux already cfg %08x, left as is\n", cfg);
++        return;
++    }
++    wr(apcs, 0x54, (cfg & ~0x71fu) | (4u << 8) | 1u);
++    wr(apcs, 0x50, cmd | 1u);
++    bool ok = poll(apcs, 0x50, 1u, 0, 10);
++    printf("OCEAN CPU: Gold mux %s cmd %08x cfg %08x (was %08x)\n",
++        ok ? "-> GPLL0, about 800 MHz" : "update TIMEOUT", rd(apcs, 0x50), rd(apcs, 0x54), cfg);
+ }
+ 
+ void ocean_gpu_start(void) {
+-    int enabled = 0;
++    int stages = 0;
+     thread_t thread;
+-    PE_parse_boot_argn("ocean_gpu", &enabled, sizeof(enabled));
+-    if (enabled != 1) { return; }
+-    printf("OCEAN GPU: Adreno 506 power probe in 20 s\n");
+-    if (kernel_thread_start(gpu_thread, NULL, &thread) == KERN_SUCCESS) {
++    PE_parse_boot_argn("ocean_gpu", &stages, sizeof(stages));
++    if (stages < 1) { return; }
++    printf("OCEAN GPU: Adreno 506 bring-up (stages %d) in 20 s\n", stages);
++    if (kernel_thread_start(gpu_thread, (void *)(uintptr_t)stages, &thread) == KERN_SUCCESS) {
+         thread_deallocate(thread);
+     }
+ }
+diff --git a/bsd/dev/ocean_sdhci.c b/bsd/dev/ocean_sdhci.c
+--- a/bsd/dev/ocean_sdhci.c
++++ b/bsd/dev/ocean_sdhci.c
+@@ -31,6 +31,7 @@
+ extern void a5xelte_log_snapshot(const char **ring, uint32_t *size, uint64_t *total);
+ extern void ocean_touch_start(void); /* bsd/dev/ocean_touch.c */
+ extern void ocean_gpu_start(void);   /* bsd/dev/ocean_gpu.c */
++extern void ocean_cpu_clocks(void);  /* bsd/dev/ocean_gpu.c */
+ int ocean_sdhci_rootdev(dev_t *);
+ static vm_offset_t ocean_regs;
+ static uint64_t ocean_sectors, ocean_first, ocean_length;
+@@ -927,6 +928,7 @@
+     if (!ocean_ready) {
+         int error=map_host(); if (error) { return error; }
+         error=find_hfs(); if (error) { return error; }
++        ocean_cpu_clocks();
+         cpu_speed();
+         fast_clock();
+         bus_width_4();
